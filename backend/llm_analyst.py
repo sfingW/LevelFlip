@@ -94,6 +94,7 @@ DATA:
 - Max Pain (OPEX pin magnet): {max_pain}
 - Expected Move (1σ band, ±): {expected_move}
 - Net GEX: {net_gex}
+- Dealer regime (total net GEX): {regime}
 
 GROUND-TRUTH REGIME (computed by the system — do NOT re-derive, NEVER contradict):
 - Relation: {relation}
@@ -144,6 +145,7 @@ class LLMAnalyst:
         max_pain: float,
         expected_move: float,
         net_gex: float,
+        regime: str,
     ) -> AnalystNote:
         """Return a cached briefing, or synthesize one (live -> static)."""
         cached = self._cache.get(ticker)
@@ -151,11 +153,11 @@ class LLMAnalyst:
             return cached
 
         note = self._generate_live(
-            ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex
+            ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex, regime
         )
         if note is None:
             note = self._generate_static(
-                ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex
+                ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex, regime
             )
 
         self._cache.set(ticker, note)
@@ -178,6 +180,7 @@ class LLMAnalyst:
         max_pain: float,
         expected_move: float,
         net_gex: float,
+        regime: str,
     ) -> Optional[AnalystNote]:
         if not _HAS_OPENAI:
             return None
@@ -192,6 +195,7 @@ class LLMAnalyst:
             max_pain=f"{max_pain:,.2f}",
             expected_move=f"{expected_move:,.2f}",
             net_gex=f"{net_gex:,.0f}",
+            regime=regime,
             relation=relation,
             family=family,
             direction=direction,
@@ -280,6 +284,7 @@ class LLMAnalyst:
         max_pain: float,
         expected_move: float,
         net_gex: float,
+        regime: str,
     ) -> AnalystNote:
         band = max(abs(spot) * 0.001, 0.05)  # 0.1% pin band around the pivot
 

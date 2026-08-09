@@ -39,7 +39,7 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
       const p = ((k - data.spot_price) / data.spot_price) * 100;
       return `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
     };
-    const regime = data.spot_price >= data.gamma_flip ? "LONG GAMMA" : "SHORT GAMMA";
+    const regime = data.regime === "LONG_GAMMA" ? "LONG GAMMA" : "SHORT GAMMA";
     const text = [
       `◆ LEVELFLIP — ${data.ticker} IOF SETUP`,
       `━━━━━━━━━━━━━━━━━━━━━━━━━`,
@@ -72,8 +72,7 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
   }, [data]);
 
   const spot = data?.spot_price;
-  const flip = data?.gamma_flip;
-  const longGamma = spot !== undefined && flip !== undefined && spot >= flip;
+  const longGamma = data?.regime === "LONG_GAMMA";
 
   return (
     <header className="flex flex-col gap-4">
@@ -98,8 +97,8 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
           <span
             title={
               longGamma
-                ? "Price above zero-gamma pivot — dealer flow dampens volatility"
-                : "Price below zero-gamma pivot — dealer flow accelerates volatility"
+                ? "Total net GEX positive — dealer hedging dampens volatility"
+                : "Total net GEX negative — dealer hedging amplifies volatility"
             }
             className={`hidden rounded-md px-2.5 py-1 text-[11px] font-bold uppercase tracking-widest sm:inline-block ${
               longGamma ? "animate-badge-green" : "animate-badge-red"

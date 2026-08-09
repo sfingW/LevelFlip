@@ -21,12 +21,15 @@ erma0x/gexxer (Apache-2.0). Formulas follow market convention:
 
 All heavy math is single-pass NumPy over the full strike grid. No
 Python-level iteration over option contracts — sub-10ms for a typical
-~400-strike chain.
+~400-strike chain. The engine consumes the top 4 front-month expirations
+and merges them into ONE unified dollar-GEX matrix: each expiry's gamma is
+priced with its own exact fractional-year DTE, every per-expiry series is
+reindexed onto the union strike grid, and the contributions are summed.
 
 Outputs:
-  - call_wall   : strike of max cumulative GEX at/above spot (short-gamma
-                  resistance)
-  - put_wall    : strike of min cumulative GEX at/below spot (structural
+  - call_wall   : strike of peak positive CALL dollar GEX (short-gamma
+                  resistance) — dollar-GEX peak, not raw contract count
+  - put_wall    : strike of peak negative PUT dollar GEX (structural
                   long-gamma support)
   - gamma_flip  : zero-gamma "LevelFlip" pivot — linear interpolation of
                   the cumulative-GEX zero crossing, nearest crossing to
@@ -34,7 +37,9 @@ Outputs:
   - max_pain    : strike minimizing total buyer payout at expiry (OPEX pin
                   magnet) — vectorized via cumulative-sum decomposition
   - expected_move : 1σ move container S * σ_ATM * sqrt(T) (68% band)
-  - atm_iv      : ATM implied vol (strike nearest spot)
+  - atm_iv      : ATM implied vol (strike nearest spot, cross-expiry mean)
+  - regime      : LONG_GAMMA / SHORT_GAMMA from total net GEX sign (keeps
+                  UI badges synchronized with total market exposure)
   - gex_profile : per-strike net GEX array (serialized in the API layer)
 """
 
@@ -44,7 +49,7 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from threading import RLock
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 from cachetools import TTLCache
@@ -70,6 +75,23 @@ VOLUME_WEIGHT = 0.7
 # ---------------------------------------------------------------------------
 # Core vectorized math
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ExpiryChain:
+    """One expiration's option chain — the engine's multi-expiry input unit.
+
+    `expiry` is the ISO date string; the engine derives that expiry's exact
+    fractional-year DTE from it (no hardcoded time-to-expiry anywhere).
+    """
+
+    expiry: Optional[str]
+    strikes: np.ndarray
+    oi_calls: np.ndarray
+    oi_puts: np.ndarray
+    iv: Optional[np.ndarray] = None
+    vol_calls: Optional[np.ndarray] = None
+    vol_puts: Optional[np.ndarray] = None
+
 
 def _tau_years(expiry: Optional[str], ref: Optional[date] = None) -> float:
     """Days to expiry in years, floored to a 1-day minimum."""
@@ -130,42 +152,26 @@ def black_scholes_greeks(
     return delta_call, delta_put, gamma
 
 
-def _walls_and_gamma_flip(
+def _gamma_flip(
     strikes: np.ndarray,
     cum_gex: np.ndarray,
     spot: float,
-) -> Tuple[float, float, float]:
-    """Call wall / put wall / zero-gamma flip from the cumulative GEX curve.
+) -> float:
+    """Zero-gamma 'LevelFlip' pivot from the cumulative net-GEX curve.
 
-    `strikes` must be sorted ascending. The zero-gamma crossing uses
-    interpolation between the two bracketing strikes of the sign change
-    (cumGEX is not monotonic, so np.interp cannot be used directly);
-    when several crossings exist the one nearest spot wins.
+    `strikes` must be sorted ascending. The zero crossing uses interpolation
+    between the two bracketing strikes of each sign change (cumGEX is not
+    monotonic, so np.interp cannot be used directly); when several crossings
+    exist the one nearest spot wins.
     """
-    above = strikes >= spot
-    below = strikes <= spot
-
-    if above.any():
-        call_wall = float(strikes[above][int(np.argmax(cum_gex[above]))])
-    else:
-        call_wall = float(strikes[int(np.argmax(cum_gex))])
-
-    if below.any():
-        put_wall = float(strikes[below][int(np.argmin(cum_gex[below]))])
-    else:
-        put_wall = float(strikes[int(np.argmin(cum_gex))])
-
     signs = np.sign(cum_gex)
     crossing_idxs = np.flatnonzero(signs[:-1] != signs[1:])
     if crossing_idxs.size:
         nearest = crossing_idxs[int(np.argmin(np.abs(strikes[crossing_idxs] - spot)))]
         k0, k1 = float(strikes[nearest]), float(strikes[nearest + 1])
         g0, g1 = float(cum_gex[nearest]), float(cum_gex[nearest + 1])
-        gamma_flip = k0 + (0.0 - g0) * (k1 - k0) / (g1 - g0) if g1 != g0 else k0
-    else:
-        gamma_flip = float(strikes[int(np.argmin(np.abs(cum_gex)))])
-
-    return call_wall, put_wall, gamma_flip
+        return k0 + (0.0 - g0) * (k1 - k0) / (g1 - g0) if g1 != g0 else k0
+    return float(strikes[int(np.argmin(np.abs(cum_gex)))])
 
 
 def _max_pain_strike(
@@ -213,7 +219,7 @@ def _atm_iv_and_move(
 
 @dataclass
 class GexResult:
-    """Output of a single engine pass over one expiry grid."""
+    """Output of one engine pass over the unified multi-expiry grid."""
 
     ticker: str
     expiry: Optional[str]
@@ -233,6 +239,7 @@ class GexResult:
     expected_move: float
     atm_iv: float
     net_gex: float
+    regime: str
 
 
 # ---------------------------------------------------------------------------
@@ -240,105 +247,159 @@ class GexResult:
 # ---------------------------------------------------------------------------
 
 class QuantEngine:
-    """Vectorized GEX computation over an anchored options chain."""
+    """Vectorized multi-expiry GEX computation over anchored option chains."""
 
     def compute(
         self,
         ticker: str,
         spot: float,
-        strikes: np.ndarray,
-        oi_calls: np.ndarray,
-        oi_puts: np.ndarray,
-        iv: Optional[np.ndarray] = None,
-        vol_calls: Optional[np.ndarray] = None,
-        vol_puts: Optional[np.ndarray] = None,
-        expiry: Optional[str] = None,
-        tau: Optional[float] = None,
+        expiries: Sequence[ExpiryChain],
         r: float = DEFAULT_RISK_FREE,
     ) -> Optional[GexResult]:
-        """Compute the full GEX surface. Returns None when no tradeable strikes exist.
+        """Compute the unified multi-expiry dollar-GEX matrix.
 
-        All contract-level math below is vectorized: mask -> sort -> greeks
-        -> gex -> cumulative -> walls, each a single NumPy expression. The
-        only Python-level iteration anywhere is serialization in the API
-        layer, never the math itself.
+        `expiries` holds the top front-month chains (front first; typically 4).
+        Each expiry's gamma is priced with its own exact fractional-year DTE
+        — the same strike in different months gets different gamma, which raw
+        Open-Interest math cannot see. Every per-expiry series is reindexed
+        onto the union strike grid and summed into one matrix.
+
+        Walls are peak dollar-GEX strikes (call wall = max call GEX, put wall
+        = most-negative put GEX) — not raw contract counts. Regime comes from
+        total net GEX so UI badges mirror total market exposure.
+
+        All contract-level math is vectorized; the only iteration is over the
+        fixed (<=4) expiry count, never over contracts.
         """
         if spot is None or not np.isfinite(spot) or spot <= 0.0:
             return None
 
-        strikes = np.asarray(strikes, dtype=np.float64)
-        oi_calls = np.asarray(oi_calls, dtype=np.float64)
-        oi_puts = np.asarray(oi_puts, dtype=np.float64)
+        per_expiry: list = []  # cleaned, sorted, greeks applied per expiry
+        for ec in expiries:
+            strikes = np.asarray(ec.strikes, dtype=np.float64)
+            oi_calls = np.asarray(ec.oi_calls, dtype=np.float64)
+            oi_puts = np.asarray(ec.oi_puts, dtype=np.float64)
+            if strikes.size == 0:
+                continue
 
-        if strikes.size == 0:
+            # Mask out garbage rows: non-positive strike, or zero OI on both sides
+            oi_calls = np.where(np.isfinite(oi_calls), oi_calls, 0.0)
+            oi_puts = np.where(np.isfinite(oi_puts), oi_puts, 0.0)
+            keep = (
+                np.isfinite(strikes)
+                & (strikes > 0.0)
+                & ((oi_calls > 0.0) | (oi_puts > 0.0))
+            )
+            if not keep.any():
+                continue
+
+            strikes = strikes[keep]
+            oi_calls = oi_calls[keep]
+            oi_puts = oi_puts[keep]
+            iv = (
+                np.asarray(ec.iv, dtype=np.float64)[keep]
+                if ec.iv is not None
+                else np.full(strikes.size, FALLBACK_IV)
+            )
+            vol_calls = (
+                np.asarray(ec.vol_calls, dtype=np.float64)[keep]
+                if ec.vol_calls is not None
+                else np.zeros_like(oi_calls)
+            )
+            vol_puts = (
+                np.asarray(ec.vol_puts, dtype=np.float64)[keep]
+                if ec.vol_puts is not None
+                else np.zeros_like(oi_puts)
+            )
+
+            # Ascending strike order — cumulative-GEX logic requires it
+            order = np.argsort(strikes, kind="stable")
+            strikes = strikes[order]
+            oi_calls = oi_calls[order]
+            oi_puts = oi_puts[order]
+            iv = iv[order]
+            vol_calls = vol_calls[order]
+            vol_puts = vol_puts[order]
+
+            # Exact fractional-year DTE for THIS expiry (no hardcoded T)
+            tau = _tau_years(ec.expiry)
+            _, _, gamma = black_scholes_greeks(spot, strikes, tau, iv, r)
+
+            # Dollar-GEX scale — S^2 (IOF Masterclass M2); positive so
+            # walls / flip are unaffected by units
+            scale = spot * spot * MOVE_SIZE * CONTRACT_MULTIPLIER
+            per_expiry.append(
+                (
+                    strikes,
+                    oi_calls,
+                    oi_puts,
+                    iv,
+                    vol_calls,
+                    vol_puts,
+                    gamma * oi_calls * scale,   # call-side dollar GEX
+                    gamma * oi_puts * scale,    # put-side dollar GEX (magnitude)
+                )
+            )
+
+        if not per_expiry:
             return None
 
-        # Mask out garbage rows: non-positive strike, or zero OI on both sides
-        oi_calls = np.where(np.isfinite(oi_calls), oi_calls, 0.0)
-        oi_puts = np.where(np.isfinite(oi_puts), oi_puts, 0.0)
-        keep = (
-            np.isfinite(strikes)
-            & (strikes > 0.0)
-            & ((oi_calls > 0.0) | (oi_puts > 0.0))
-        )
-        if not keep.any():
-            return None
+        # Union strike axis across all expiries; every expiry's strikes are
+        # a subset of it, so searchsorted gives exact positions
+        grid = np.unique(np.concatenate([g[0] for g in per_expiry]))
+        n = grid.size
+        pos = [np.searchsorted(grid, g[0]) for g in per_expiry]
 
-        strikes = strikes[keep]
-        oi_calls = oi_calls[keep]
-        oi_puts = oi_puts[keep]
+        oi_calls = np.zeros(n)
+        oi_puts = np.zeros(n)
+        vol_calls = np.zeros(n)
+        vol_puts = np.zeros(n)
+        gex_calls = np.zeros(n)
+        gex_puts = np.zeros(n)
+        iv_mat = np.full((len(per_expiry), n), np.nan)
 
-        iv = (
-            np.asarray(iv, dtype=np.float64)[keep]
-            if iv is not None
-            else np.full(strikes.size, FALLBACK_IV)
-        )
-        vol_calls = (
-            np.asarray(vol_calls, dtype=np.float64)[keep]
-            if vol_calls is not None
-            else np.zeros_like(oi_calls)
-        )
-        vol_puts = (
-            np.asarray(vol_puts, dtype=np.float64)[keep]
-            if vol_puts is not None
-            else np.zeros_like(oi_puts)
-        )
+        for i, g in enumerate(per_expiry):
+            p = pos[i]
+            oi_calls[p] += g[1]
+            oi_puts[p] += g[2]
+            iv_mat[i, p] = g[3]
+            vol_calls[p] += g[4]
+            vol_puts[p] += g[5]
+            gex_calls[p] += g[6]
+            gex_puts[p] += g[7]
 
-        # Ascending strike order — cumulative-GEX logic requires it
-        order = np.argsort(strikes, kind="stable")
-        strikes = strikes[order]
-        oi_calls = oi_calls[order]
-        oi_puts = oi_puts[order]
-        iv = iv[order]
-        vol_calls = vol_calls[order]
-        vol_puts = vol_puts[order]
+        # Cross-expiry mean IV per strike (missing months -> NaN, ignored)
+        iv = np.nanmean(iv_mat, axis=0)
+        iv = np.where(np.isfinite(iv) & (iv > 0.0), iv, FALLBACK_IV)
 
-        if tau is None:
-            tau = _tau_years(expiry)
-
-        _, _, gamma = black_scholes_greeks(spot, strikes, tau, iv, r)
-
-        # Per-strike dealer GEX — dollar form (IOF Masterclass M2):
-        # gamma * net dealer OI * S^2 * 1% * multiplier
-        net_oi = oi_calls - oi_puts
-        gex = gamma * net_oi * spot * spot * MOVE_SIZE * CONTRACT_MULTIPLIER
-
+        gex = gex_calls - gex_puts
         cum_gex = np.cumsum(gex)
-        call_wall, put_wall, gamma_flip = _walls_and_gamma_flip(strikes, cum_gex, spot)
 
-        # Max Pain + 1σ expected move (paper M2 §4-§5) — both vectorized
-        max_pain = _max_pain_strike(strikes, oi_calls, oi_puts)
-        atm_iv, expected_move = _atm_iv_and_move(spot, tau, iv, strikes)
+        # Walls = peak dollar-GEX strikes (not raw contract counts):
+        #   call wall -> strike of max call dollar GEX
+        #   put wall  -> strike of most-negative put dollar GEX
+        call_wall = float(grid[int(np.argmax(gex_calls))])
+        put_wall = float(grid[int(np.argmin(-gex_puts))])
+        gamma_flip = _gamma_flip(grid, cum_gex, spot)
+
+        # Max Pain + 1σ expected move (paper M2 §4-§5) — vectorized, on the
+        # combined book; EM horizon = front month (dominant hedging window)
+        max_pain = _max_pain_strike(grid, oi_calls, oi_puts)
+        front_tau = _tau_years(expiries[0].expiry)
+        atm_iv, expected_move = _atm_iv_and_move(spot, front_tau, iv, grid)
 
         # Weighted wall-strength heuristic (OI*0.3 + Volume*0.7), vectorized
         wall_score_calls = oi_calls * OI_WEIGHT + vol_calls * VOLUME_WEIGHT
         wall_score_puts = oi_puts * OI_WEIGHT + vol_puts * VOLUME_WEIGHT
 
+        net_gex_total = float(gex.sum())
+        regime = "LONG_GAMMA" if net_gex_total >= 0.0 else "SHORT_GAMMA"
+
         return GexResult(
             ticker=ticker,
-            expiry=expiry,
+            expiry=expiries[0].expiry,
             spot=float(spot),
-            strikes=strikes,
+            strikes=grid,
             oi_calls=oi_calls,
             oi_puts=oi_puts,
             iv=iv,
@@ -352,7 +413,8 @@ class QuantEngine:
             max_pain=max_pain,
             expected_move=expected_move,
             atm_iv=atm_iv,
-            net_gex=float(gex.sum()),
+            net_gex=net_gex_total,
+            regime=regime,
         )
 
 

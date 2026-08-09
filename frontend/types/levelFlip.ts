@@ -31,6 +31,7 @@ export interface IOFPayload {
   expected_move: number;
   atm_iv: number;
   net_gex: number;
+  regime: string; // "LONG_GAMMA" | "SHORT_GAMMA" — total net GEX sign
   chain_stale: boolean;
   gex_profile: GexBar[];
   analysis: AnalystNote | null;

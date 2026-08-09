@@ -11,7 +11,7 @@ import { useIOFData } from "@/lib/api";
 export default function Page() {
   const [ticker, setTicker] = useState("SPY");
   const { data, isLoading, error } = useIOFData(ticker);
-  const longGamma = data ? data.spot_price >= data.gamma_flip : null;
+  const longGamma = data ? data.regime === "LONG_GAMMA" : null;
 
   return (
     <main className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-3 px-4 pb-4 pt-5">
@@ -47,8 +47,8 @@ export default function Page() {
                 </div>
                 <p className="mt-2 text-xs leading-relaxed text-slate-400">
                   {longGamma
-                    ? "Dealers buy dips and sell rallies above the pivot — volatility is dampened, pullbacks get absorbed."
-                    : "Dealers are forced to sell into drops and buy into surges below the pivot — volatility expands, breakdowns accelerate."}
+                    ? "Dealers are net-long gamma — their hedging dampens moves: dips get absorbed, rallies get faded. Volatility compresses."
+                    : "Dealers are net-short gamma — their hedging amplifies moves: drops force selling, surges force buying. Volatility expands."}
                 </p>
               </>
             )}

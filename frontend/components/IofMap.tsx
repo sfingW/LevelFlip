@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo } from "react";
-import { formatBig, formatDelta, formatPrice } from "@/lib/api";
+import { useMemo, useRef, useState } from "react";
+import type { MouseEvent } from "react";
+import { formatBig, formatDelta, formatPrice, formatSigma } from "@/lib/api";
 import type { IOFPayload } from "@/types/levelFlip";
 
 interface IofMapProps {
@@ -21,7 +22,11 @@ const MAX_BARS = 44;
 
 const C = {
   positive: "#22C55E",
+  positiveBright: "#86EFAC",
+  positiveDeep: "#16A34A",
   negative: "#EF4444",
+  negativeBright: "#FCA5A5",
+  negativeDeep: "#B91C1C",
   callWall: "#EF4444",
   putWall: "#22C55E",
   flip: "#F59E0B",
@@ -36,11 +41,18 @@ const MONO = "var(--font-mono), ui-monospace, monospace";
 
 /**
  * IOF Battle Map — the whole dealer story in one glance:
- * GEX histogram by strike, ±1σ expected-move band, the four structural
- * hairlines (call wall / levelflip / max pain / put wall), live spot with
- * pulse, and the dealer regime banner. Custom-rendered SVG: no chart lib.
+ * GEX histogram by strike (2.5D prism bars), ±1σ expected-move band, the four
+ * structural hairlines (call wall / levelflip / max pain / put wall), live
+ * spot with pulse, and the dealer regime banner. Fully interactive: hover a
+ * bar for the strike's full book (GEX / OI / IV / delta vs spot).
+ * Custom-rendered SVG: no chart lib, no WebGL.
  */
 export default function IofMap({ data }: IofMapProps) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const [hoveredStrike, setHoveredStrike] = useState<number | null>(null);
+  const [tip, setTip] = useState<{ left: number; top: number } | null>(null);
+
   const model = useMemo(() => {
     if (!data) return null;
     const spot = data.spot_price;
@@ -61,6 +73,38 @@ export default function IofMap({ data }: IofMapProps) {
     return { spot, bars, maxAbs, y, clampY, halfStep: span / bars.length / 2, span, kMin, kMax };
   }, [data]);
 
+  const onMove = (e: MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    const box = boxRef.current;
+    if (!svg || !box || !model) return;
+    const rect = svg.getBoundingClientRect();
+    const sx = ((e.clientX - rect.left) * W) / rect.width;
+    const sy = ((e.clientY - rect.top) * H) / rect.height;
+    const k = model.kMax - ((sy - PAD_TOP) * model.span) / (H - PAD_TOP - PAD_BOTTOM);
+
+    let best = model.bars[0].strike;
+    let bestD = Infinity;
+    for (const b of model.bars) {
+      const d = Math.abs(b.strike - k);
+      if (d < bestD) {
+        bestD = d;
+        best = b.strike;
+      }
+    }
+    setHoveredStrike((prev) => (prev === best ? prev : best));
+
+    const boxRect = box.getBoundingClientRect();
+    setTip({
+      left: Math.min(e.clientX - boxRect.left + 14, boxRect.width - 184),
+      top: Math.max(e.clientY - boxRect.top - 96, 6),
+    });
+  };
+
+  const onLeave = () => {
+    setHoveredStrike(null);
+    setTip(null);
+  };
+
   if (!model) {
     return (
       <div className="card h-[460px]">
@@ -71,7 +115,9 @@ export default function IofMap({ data }: IofMapProps) {
 
   const { spot, bars, maxAbs, y, clampY, halfStep, span, kMin, kMax } = model;
   const d = data!;
-  const longGamma = spot >= d.gamma_flip;
+  const longGamma = d.regime === "LONG_GAMMA";
+  const hovered = hoveredStrike === null ? undefined : bars.find((b) => b.strike === hoveredStrike);
+  const peak = bars.reduce((a, b) => (Math.abs(b.gex) > Math.abs(a.gex) ? b : a));
 
   const levels = [
     { key: "call_wall", label: "Call Wall", k: d.call_wall, color: C.callWall },
@@ -85,14 +131,18 @@ export default function IofMap({ data }: IofMapProps) {
   const emHi = spot + d.expected_move;
   const emLo = spot - d.expected_move;
 
+  // 2.5D extrusion: prism gradient body + lighter top cap (the "lit" edge)
+  const barOpacity = (strike: number) =>
+    hoveredStrike === null ? 0.85 : strike === hoveredStrike ? 1 : 0.35;
+
   return (
-    <div className="card relative h-[460px] overflow-hidden">
+    <div ref={boxRef} className="card relative h-[460px] overflow-hidden">
       {/* header */}
       <div className="mb-1 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="level-label">IOF Battle Map</span>
           <span className="rounded border border-edge/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-widest text-slate-500">
-            GEX by strike
+            GEX by strike · 4 expiries
           </span>
         </div>
         <span
@@ -125,7 +175,24 @@ export default function IofMap({ data }: IofMapProps) {
         ))}
       </div>
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="h-[calc(100%-30px)] w-full">
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${H}`}
+        className="h-[calc(100%-30px)] w-full cursor-crosshair"
+        onMouseMove={onMove}
+        onMouseLeave={onLeave}
+      >
+        <defs>
+          <linearGradient id="g-pos" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={C.positiveBright} />
+            <stop offset="100%" stopColor={C.positiveDeep} />
+          </linearGradient>
+          <linearGradient id="g-neg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={C.negativeBright} />
+            <stop offset="100%" stopColor={C.negativeDeep} />
+          </linearGradient>
+        </defs>
+
         {/* 1σ expected-move band */}
         <rect
           x={PAD_LEFT}
@@ -157,25 +224,62 @@ export default function IofMap({ data }: IofMapProps) {
           strokeDasharray="2 5"
         />
 
-        {/* GEX bars */}
+        {/* hovered-strike row band */}
+        {hovered && (
+          <rect
+            x={PAD_LEFT}
+            y={clampY(hovered.strike + halfStep)}
+            width={CHART_W}
+            height={Math.max(clampY(hovered.strike - halfStep) - clampY(hovered.strike + halfStep), 1)}
+            fill="#FFFFFF"
+            opacity={0.05}
+          />
+        )}
+
+        {/* GEX bars — 2.5D prism: gradient body + bright top cap */}
         {bars.map((b) => {
           const y0 = clampY(b.strike + halfStep);
           const h = Math.max(clampY(b.strike - halfStep) - y0, 1);
           const len = (Math.abs(b.gex) / maxAbs) * (CHART_W / 2 - 12);
           const pos = b.gex >= 0;
+          const x = pos ? CX : CX - Math.max(len, 1);
+          const w = Math.max(len, 1);
+          const op = barOpacity(b.strike);
+          const isPeak = b.strike === peak.strike;
           return (
-            <rect
-              key={b.strike}
-              x={pos ? CX : CX - Math.max(len, 1)}
-              y={y0}
-              width={Math.max(len, 1)}
-              height={h}
-              rx={2}
-              fill={pos ? C.positive : C.negative}
-              opacity={0.85}
-            >
-              <title>{`${formatPrice(b.strike)} — ${formatBig(b.gex)}`}</title>
-            </rect>
+            <g key={b.strike}>
+              <rect
+                x={x}
+                y={y0}
+                width={w}
+                height={h}
+                rx={2}
+                fill={pos ? "url(#g-pos)" : "url(#g-neg)"}
+                opacity={op}
+                stroke={hoveredStrike === b.strike ? "rgba(255,255,255,0.35)" : "none"}
+                strokeWidth={hoveredStrike === b.strike ? 1 : 0}
+              >
+                <title>{`${formatPrice(b.strike)} — ${formatBig(b.gex)}`}</title>
+              </rect>
+              {/* extruded top cap (the lit prism edge) */}
+              {h > 6 && (
+                <rect
+                  x={x}
+                  y={y0}
+                  width={w}
+                  height={Math.min(3, h)}
+                  rx={1.5}
+                  fill={pos ? C.positiveBright : C.negativeBright}
+                  opacity={hoveredStrike === null ? 0.9 : hoveredStrike === b.strike ? 1 : 0.4}
+                />
+              )}
+              {/* deepest |GEX| bar gets a breathing highlight */}
+              {isPeak && (
+                <rect x={x} y={y0} width={w} height={h} rx={2} fill="none" stroke={pos ? C.positiveBright : C.negativeBright} strokeWidth={1} opacity={0.5}>
+                  <animate attributeName="opacity" values="0.25;0.7;0.25" dur="2.6s" repeatCount="indefinite" />
+                </rect>
+              )}
+            </g>
           );
         })}
 
@@ -236,6 +340,37 @@ export default function IofMap({ data }: IofMapProps) {
           ) : null
         )}
       </svg>
+
+      {/* hover tooltip — the strike's full book */}
+      {hovered && tip && (
+        <div
+          className="pointer-events-none absolute z-20 w-44 rounded-lg border border-white/10 bg-canvas/95 p-2.5 font-mono shadow-2xl backdrop-blur"
+          style={{ left: tip.left, top: tip.top }}
+        >
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-sm font-bold tabular-nums text-slate-100">{formatPrice(hovered.strike)}</span>
+            <span className="text-[10px] tabular-nums" style={{ color: hovered.gex >= 0 ? C.putWall : C.callWall }}>
+              {formatDelta(hovered.strike, spot)}
+            </span>
+          </div>
+          <div className="mt-1.5 flex items-center justify-between">
+            <span className="text-[9px] uppercase tracking-widest text-slate-500">GEX</span>
+            <span className="text-[11px] font-bold tabular-nums" style={{ color: hovered.gex >= 0 ? C.putWall : C.callWall }}>
+              {formatBig(hovered.gex)}
+            </span>
+          </div>
+          <div className="mt-1 flex items-center justify-between">
+            <span className="text-[9px] uppercase tracking-widest text-slate-500">OI C / P</span>
+            <span className="text-[11px] tabular-nums text-slate-300">
+              {hovered.oi_calls.toLocaleString()} / {hovered.oi_puts.toLocaleString()}
+            </span>
+          </div>
+          <div className="mt-1 flex items-center justify-between">
+            <span className="text-[9px] uppercase tracking-widest text-slate-500">IV</span>
+            <span className="text-[11px] tabular-nums text-slate-300">{formatSigma(hovered.iv)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

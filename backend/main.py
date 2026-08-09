@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from llm_analyst import AnalystNote, LLMAnalyst
-from quant_engine import LockedTTLCache, QuantEngine
+from quant_engine import ExpiryChain, LockedTTLCache, QuantEngine
 
 try:
     from dotenv import load_dotenv
@@ -94,6 +94,7 @@ class IOFPayload(BaseModel):
     expected_move: float
     atm_iv: float
     net_gex: float
+    regime: str
     chain_stale: bool
     gex_profile: List[GexBar]
     analysis: Optional[AnalystNote] = None
@@ -271,66 +272,80 @@ class ChainData:
 
 @dataclass
 class ChainEntry:
-    data: ChainData
+    data: List[ChainData]  # top front-month expirations, front first
     fetched_ts: float
 
 
 class YFinanceChainFetcher:
-    """Morning-anchor chain fetch (strikes/OI/volume/IV) via yfinance."""
+    """Morning-anchor multi-expiry chain fetch (strikes/OI/volume/IV).
+
+    Pulls the top 4 front-month expirations (>=2 days out, skipping noisy
+    0DTE) so the engine can build one unified dollar-GEX matrix across the
+    whole near-term book. A single failing expiry is skipped, never fatal.
+    """
+
+    FRONT_MONTHS = 4
 
     def __init__(self) -> None:
         from yfinance import Ticker
 
         self._ticker_cls = Ticker
 
-    def fetch(self, ticker: str) -> Optional[ChainData]:
+    def fetch(self, ticker: str) -> Optional[List[ChainData]]:
         try:
             yt = self._ticker_cls(ticker)
             expirations = list(yt.options)
             if not expirations:
                 log.warning("No option expirations for %s", ticker)
                 return None
-            expiry = self._pick_expiry(expirations)
-            chain = yt.option_chain(expiry)
+            pool = self._pick_expiries(expirations)
 
-            calls = chain.calls[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
-                columns={
-                    "openInterest": "oi_calls",
-                    "volume": "vol_calls",
-                    "impliedVolatility": "iv_calls",
-                }
-            )
-            puts = chain.puts[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
-                columns={
-                    "openInterest": "oi_puts",
-                    "volume": "vol_puts",
-                    "impliedVolatility": "iv_puts",
-                }
-            )
-            df = pd.merge(calls, puts, on="strike", how="outer").sort_values("strike")
-            iv = df[["iv_calls", "iv_puts"]].mean(axis=1, skipna=True)
-
-            return ChainData(
-                ticker=ticker,
-                expiry=expiry,
-                strikes=df["strike"].to_numpy(dtype=np.float64),
-                oi_calls=df["oi_calls"].fillna(0.0).to_numpy(dtype=np.float64),
-                oi_puts=df["oi_puts"].fillna(0.0).to_numpy(dtype=np.float64),
-                vol_calls=df["vol_calls"].fillna(0.0).to_numpy(dtype=np.float64),
-                vol_puts=df["vol_puts"].fillna(0.0).to_numpy(dtype=np.float64),
-                iv=iv.to_numpy(dtype=np.float64),
-            )
+            chains: List[ChainData] = []
+            for expiry in pool:
+                try:
+                    chain = yt.option_chain(expiry)
+                    calls = chain.calls[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
+                        columns={
+                            "openInterest": "oi_calls",
+                            "volume": "vol_calls",
+                            "impliedVolatility": "iv_calls",
+                        }
+                    )
+                    puts = chain.puts[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
+                        columns={
+                            "openInterest": "oi_puts",
+                            "volume": "vol_puts",
+                            "impliedVolatility": "iv_puts",
+                        }
+                    )
+                    df = pd.merge(calls, puts, on="strike", how="outer").sort_values("strike")
+                    iv = df[["iv_calls", "iv_puts"]].mean(axis=1, skipna=True)
+                    chains.append(
+                        ChainData(
+                            ticker=ticker,
+                            expiry=expiry,
+                            strikes=df["strike"].to_numpy(dtype=np.float64),
+                            oi_calls=df["oi_calls"].fillna(0.0).to_numpy(dtype=np.float64),
+                            oi_puts=df["oi_puts"].fillna(0.0).to_numpy(dtype=np.float64),
+                            vol_calls=df["vol_calls"].fillna(0.0).to_numpy(dtype=np.float64),
+                            vol_puts=df["vol_puts"].fillna(0.0).to_numpy(dtype=np.float64),
+                            iv=iv.to_numpy(dtype=np.float64),
+                        )
+                    )
+                except Exception as exc:
+                    log.warning("Chain fetch failed for %s %s: %s", ticker, expiry, exc)
+            return chains or None
         except Exception as exc:
             log.warning("Chain fetch failed for %s: %s", ticker, exc)
             return None
 
     @staticmethod
-    def _pick_expiry(expirations: List[str]) -> str:
-        """Nearest expiry at least 2 days out (skips noisy 0DTE); else earliest."""
+    def _pick_expiries(expirations: List[str]) -> List[str]:
+        """Top 4 expirations at least 2 days out (skips noisy 0DTE); else earliest."""
         today = date.today()
         usable = [e for e in expirations if (date.fromisoformat(e) - today).days >= 2]
         pool = usable or expirations
-        return min(pool, key=lambda e: date.fromisoformat(e))
+        return sorted(pool, key=lambda e: date.fromisoformat(e))[: YFinanceChainFetcher.FRONT_MONTHS]
 
 
 # ---------------------------------------------------------------------------
@@ -387,20 +402,25 @@ class LevelFlipApp:
         if spot is None:
             raise HTTPException(status_code=503, detail=f"spot feed unavailable for {ticker}")
 
-        chain, stale = self.get_chain(ticker)
-        if chain is None:
+        chains, stale = self.get_chain(ticker)
+        if not chains:
             raise HTTPException(status_code=502, detail=f"no options chain available for {ticker}")
 
         result = self.engine.compute(
             ticker=ticker,
             spot=spot,
-            strikes=chain.strikes,
-            oi_calls=chain.oi_calls,
-            oi_puts=chain.oi_puts,
-            iv=chain.iv,
-            vol_calls=chain.vol_calls,
-            vol_puts=chain.vol_puts,
-            expiry=chain.expiry,
+            expiries=[
+                ExpiryChain(
+                    expiry=c.expiry,
+                    strikes=c.strikes,
+                    oi_calls=c.oi_calls,
+                    oi_puts=c.oi_puts,
+                    iv=c.iv,
+                    vol_calls=c.vol_calls,
+                    vol_puts=c.vol_puts,
+                )
+                for c in chains
+            ],
         )
         if result is None:
             raise HTTPException(status_code=503, detail="engine produced no tradeable strikes")
@@ -434,6 +454,7 @@ class LevelFlipApp:
                 max_pain=result.max_pain,
                 expected_move=result.expected_move,
                 net_gex=result.net_gex,
+                regime=result.regime,
             )
 
         return IOFPayload(
@@ -447,6 +468,7 @@ class LevelFlipApp:
             expected_move=result.expected_move,
             atm_iv=result.atm_iv,
             net_gex=result.net_gex,
+            regime=result.regime,
             chain_stale=stale,
             gex_profile=profile,
             analysis=analysis,
