@@ -59,7 +59,13 @@ from data_lanes import (
     NewsItem,
 )
 from llm_analyst import AnalystNote, LLMAnalyst
-from quant_engine import ExpiryChain, LockedTTLCache, QuantEngine
+from quant_engine import (
+    DEFAULT_RISK_FREE,
+    ExpiryChain,
+    LockedTTLCache,
+    QuantEngine,
+    black_scholes_greeks,
+)
 
 try:
     from dotenv import load_dotenv
@@ -101,6 +107,8 @@ PAYLOAD_TTL_SECONDS = 2.0
 CANDLES_TTL_SECONDS = 30.0          # 1-minute bars only change once a minute
 NEWS_TTL_SECONDS = 300.0            # headline feed (matches analyst cache TTL)
 FLOW_TTL_SECONDS = 30.0             # options prints
+RESULT_TTL_SECONDS = 30.0           # computed GexResult cache (iof/expiry_gex share it)
+VOL_TTL_SECONDS = 300.0             # vol surface (LSE rows already cached 5 min)
 
 _TICKER_PATTERN = re.compile(r"^[A-Z0-9._^/-]{1,12}$")
 
@@ -115,6 +123,85 @@ class GexBar(BaseModel):
     oi_calls: int
     oi_puts: int
     iv: float
+    dex: float  # dollar delta exposure (dealers), puts counted negative
+    vex: float  # dollar vanna exposure per vol point
+
+
+class ExpiryGexRow(BaseModel):
+    """One expiry's own dollar-GEX grid (heatmap row)."""
+
+    expiry: str
+    dte: int
+    strikes: List[float]
+    gex: List[float]
+    oi_calls: List[float]
+    oi_puts: List[float]
+    iv: List[float]
+
+
+class ExpiryBreakdownRow(BaseModel):
+    """Expiry contribution to total GEX, bucketed 0DTE / Weekly / Monthly."""
+
+    bucket: str  # "0DTE" | "WEEKLY" | "MONTHLY" | "LEAPS"
+    expiry: str
+    dte: int
+    dollar_gex: float
+    oi_calls: float
+    oi_puts: float
+    pct: float  # share of total dollar GEX
+
+
+class ExpiryGexPayload(BaseModel):
+    ticker: str
+    spot: float
+    as_of: str
+    breakdown: List[ExpiryBreakdownRow]
+    expiries: List[ExpiryGexRow]
+
+
+class VolExpiryRow(BaseModel):
+    """One expiry's IV smile + greeks grid (vol surface)."""
+
+    expiry: str
+    dte: int
+    strikes: List[float]
+    call_iv: List[Optional[float]]
+    put_iv: List[Optional[float]]
+    delta: List[Optional[float]]
+    gamma: List[Optional[float]]
+    vega: List[Optional[float]]
+    atm_iv: Optional[float]
+    atm_strike: Optional[float]
+    skew_25: Optional[float]  # 25Δ put IV − 25Δ call IV
+
+
+class VolTermPoint(BaseModel):
+    """ATM IV (and 25Δ skew) at one expiry — the term-structure curve."""
+
+    expiry: str
+    dte: int
+    atm_iv: Optional[float]
+    skew_25: Optional[float]
+
+
+class VolSignals(BaseModel):
+    """Deterministic vol analytics — IV vs HV premium, term shape, skew stress."""
+
+    hv30: Optional[float]
+    iv_hv_premium: Optional[float]  # atm_iv / hv30 − 1
+    term_shape: str                 # "BACKWARDATION" | "CONTANGO" | "FLAT"
+    skew_stress: str                # "PUT_SKEW_STRESS" | "CALL_SKEW_STRESS" | "NEUTRAL_SKEW"
+    vol_regime: str                 # "EXPENSIVE" | "CHEAP" | "FAIR" vs realized vol
+
+
+class VolPayload(BaseModel):
+    ticker: str
+    spot: Optional[float]
+    as_of: str
+    source: str
+    expiries: List[VolExpiryRow]
+    term_structure: List[VolTermPoint]
+    signals: VolSignals
 
 
 class IOFPayload(BaseModel):
@@ -129,6 +216,8 @@ class IOFPayload(BaseModel):
     atm_iv: float
     net_gex: float
     regime: str
+    net_dex: float  # dealer dollar delta exposure
+    net_vex: float  # dealer dollar vanna exposure (per vol point)
     market_state: str  # "open" | "pre_market" | "post_market" | "closed"
     chain_stale: bool
     gex_profile: List[GexBar]
@@ -157,6 +246,8 @@ class FlowPrint(BaseModel):
     volume: int
     side: Optional[str]
     timestamp: str
+    dte: Optional[int] = None
+    delta: Optional[float] = None
 
 
 class FlowPayload(BaseModel):
@@ -480,11 +571,14 @@ class LevelFlipApp:
         self.candles_cache = LockedTTLCache(maxsize=32, ttl=CANDLES_TTL_SECONDS)
         self.news_cache = LockedTTLCache(maxsize=64, ttl=NEWS_TTL_SECONDS)
         self.flow_cache = LockedTTLCache(maxsize=32, ttl=FLOW_TTL_SECONDS)
+        self.result_cache = LockedTTLCache(maxsize=64, ttl=RESULT_TTL_SECONDS)
+        self.vol_cache = LockedTTLCache(maxsize=32, ttl=VOL_TTL_SECONDS)
         self.poller = SpotPoller(self.spot_cache)
-        # Chain anchor lanes: LSE (chain+greeks) -> Alpha Vantage (EOD OI
-        # baseline, 25/day budget) -> yfinance (today's default).
+        # Chain anchor lanes: LSE (vol/greeks feed — no OI, cannot anchor GEX)
+        # -> Alpha Vantage (EOD OI baseline, 25/day budget) -> yfinance (OI anchor).
+        self.lse = LSEChainFetcher()
         self.chain_fetcher = FallbackChainFetcher(
-            [LSEChainFetcher(), AlphaVantageChainFetcher(), YFinanceChainFetcher()]
+            [self.lse, AlphaVantageChainFetcher(), YFinanceChainFetcher()]
         )
         self.news_fetcher = FallbackNewsFetcher()
         self.flow_fetcher = LSEOptionsFlow()
@@ -520,8 +614,12 @@ class LevelFlipApp:
                 return entry.data, True
         return None, False
 
-    def build_payload(self, ticker: str, include_analysis: bool) -> IOFPayload:
-        """Assemble the full LevelFlip payload for one ticker."""
+    def get_result(self, ticker: str) -> object:
+        """Engine pass for a ticker (spot + anchored chain), cached 30 s."""
+        cached = self.result_cache.get(ticker)
+        if cached is not None:
+            return cached
+
         spot = self.poller.current(ticker)
         if spot is None:
             raise HTTPException(status_code=503, detail=f"spot feed unavailable for {ticker}")
@@ -548,6 +646,14 @@ class LevelFlipApp:
         )
         if result is None:
             raise HTTPException(status_code=503, detail="engine produced no tradeable strikes")
+        result._chain_stale = stale  # stash for payload serialization (cached w/ result)
+        self.result_cache.set(ticker, result)
+        return result
+
+    def build_payload(self, ticker: str, include_analysis: bool) -> IOFPayload:
+        """Assemble the full LevelFlip payload for one ticker."""
+        result = self.get_result(ticker)
+        spot = result.spot
 
         # Serialization only — the math above is fully vectorized
         profile = [
@@ -557,13 +663,17 @@ class LevelFlipApp:
                 oi_calls=int(round(oc)),
                 oi_puts=int(round(op)),
                 iv=float(v),
+                dex=float(d),
+                vex=float(vx),
             )
-            for s, g, oc, op, v in zip(
+            for s, g, oc, op, v, d, vx in zip(
                 result.strikes.tolist(),
                 result.gex.tolist(),
                 result.oi_calls.tolist(),
                 result.oi_puts.tolist(),
                 result.iv.tolist(),
+                result.dex.tolist(),
+                result.vex.tolist(),
             )
         ]
 
@@ -594,12 +704,248 @@ class LevelFlipApp:
             expected_move=result.expected_move,
             atm_iv=result.atm_iv,
             net_gex=result.net_gex,
+            net_dex=result.net_dex,
+            net_vex=result.net_vex,
             regime=result.regime,
             market_state=_market_state(),
-            chain_stale=stale,
+            chain_stale=getattr(result, "_chain_stale", False),
             gex_profile=profile,
             analysis=analysis,
         )
+
+    def get_expiry_gex(self, ticker: str) -> ExpiryGexPayload:
+        """Per-expiry dollar-GEX grids plus the 0DTE/Weekly/Monthly/LEAPS breakdown.
+
+        Every expiry keeps its own grid (before union-grid merge) so the
+        heatmap shows where each expiration actually pins its GEX.
+        """
+        result = self.get_result(ticker)
+
+        rows = [
+            ExpiryGexRow(
+                expiry=exp.expiry,
+                dte=int(exp.dte_days),
+                strikes=[float(s) for s in exp.strikes.tolist()],
+                gex=[float(g) for g in exp.gex.tolist()],
+                oi_calls=[float(c) for c in exp.oi_calls.tolist()],
+                oi_puts=[float(p) for p in exp.oi_puts.tolist()],
+                iv=[float(v) for v in exp.iv.tolist()],
+            )
+            for exp in result.expiry_gex
+        ]
+        rows.sort(key=lambda r: r.dte)
+
+        total = sum(float(np.sum(exp.gex)) for exp in result.expiry_gex) or 1.0
+        breakdown = []
+        for exp in result.expiry_gex:
+            dte = int(exp.dte_days)
+            bucket = (
+                "0DTE" if dte == 0 else "WEEKLY" if dte <= 7 else "MONTHLY" if dte <= 45 else "LEAPS"
+            )
+            dollar = float(np.sum(exp.gex))
+            breakdown.append(
+                ExpiryBreakdownRow(
+                    bucket=bucket,
+                    expiry=exp.expiry,
+                    dte=dte,
+                    dollar_gex=dollar,
+                    oi_calls=float(np.sum(exp.oi_calls)),
+                    oi_puts=float(np.sum(exp.oi_puts)),
+                    pct=dollar / total,
+                )
+            )
+        breakdown.sort(key=lambda r: r.dte)
+
+        return ExpiryGexPayload(
+            ticker=ticker,
+            spot=float(result.spot),
+            as_of=datetime.now(timezone.utc).isoformat(),
+            breakdown=breakdown,
+            expiries=rows,
+        )
+
+    @staticmethod
+    def _iv_array(xs: list, n: int) -> np.ndarray:
+        """Numeric list -> float array, non-numeric entries become NaN."""
+        out = np.full(n, np.nan)
+        for i, x in enumerate(xs):
+            try:
+                out[i] = float(x)
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _vol_row(
+        self,
+        expiry: str,
+        dte: int,
+        strikes: list,
+        call_iv: list,
+        put_iv: list,
+        delta: Optional[list],
+        gamma: Optional[list],
+        vega: Optional[list],
+        spot: Optional[float],
+        tau: Optional[float],
+    ) -> VolExpiryRow:
+        """One expiry's smile + ATM IV + 25Δ skew (delta-anchored interpolation).
+
+        25Δ put delta is call_delta − 1, so the 25Δ put strike sits where the
+        *call* delta is 0.75 — both sides are interpolated off the call-delta
+        axis (monotonic in strike).
+        """
+        n = len(strikes)
+        k = np.array([float(s) for s in strikes], dtype=float)
+        ci = self._iv_array(call_iv, n)
+        pi = self._iv_array(put_iv, n)
+        valid = np.isfinite(ci) | np.isfinite(pi)
+
+        atm_iv = atm_strike = skew_25 = None
+        if spot is not None and valid.any():
+            idx = int(np.argmin(np.abs(k - spot)))
+            atm_strike = float(k[idx])
+            sides = [v for v in (ci[idx], pi[idx]) if np.isfinite(v)]
+            if sides:
+                atm_iv = float(np.mean(sides))
+
+            # delta axis: use provided call deltas, else BS from IV blend
+            dc = None
+            if delta is not None and len(delta) == n:
+                dc = self._iv_array(delta, n)
+            elif tau is not None and tau > 0:
+                dc, _dp, _g, _v = black_scholes_greeks(spot, k, tau, np.nanmean([ci, pi], axis=0), DEFAULT_RISK_FREE)
+            if dc is not None and np.isfinite(dc).sum() >= 2:
+                order = np.argsort(-dc)  # descending call delta == ascending strike
+                x, yc, yp = -dc[order], ci[order], pi[order]
+                iv25c = float(np.interp(-0.25, x, yc)) if np.isfinite(yc).sum() >= 2 else None
+                iv25p = float(np.interp(-0.75, x, yp)) if np.isfinite(yp).sum() >= 2 else None
+                if iv25c is not None and iv25p is not None and np.isfinite(iv25c) and np.isfinite(iv25p):
+                    skew_25 = iv25p - iv25c
+
+        def _num_or_none(xs: Optional[list]) -> List[Optional[float]]:
+            if xs is None:
+                return [None] * n
+            return [None if not np.isfinite(v) else float(v) for v in self._iv_array(xs, n)]
+
+        return VolExpiryRow(
+            expiry=expiry,
+            dte=int(dte),
+            strikes=[float(s) for s in strikes],
+            call_iv=_num_or_none(call_iv),
+            put_iv=_num_or_none(put_iv),
+            delta=_num_or_none(delta),
+            gamma=_num_or_none(gamma),
+            vega=_num_or_none(vega),
+            atm_iv=atm_iv,
+            atm_strike=atm_strike,
+            skew_25=skew_25,
+        )
+
+    def get_vol(self, ticker: str) -> VolPayload:
+        """IV surface (smiles per expiry), term structure, and vol signals.
+
+        LSE lane is primary (delta/gamma/vega live); the chain lane (yfinance
+        vol_calls/vol_puts) backfills the smile when LSE is down. Signals are
+        deterministic vol analytics — IV/HV premium, term shape, 25Δ skew
+        stress — not an ML model (honest about what our data supports).
+        """
+        cached = self.vol_cache.get(ticker)
+        if cached is not None:
+            return cached
+
+        spot = self.poller.current(ticker)
+        rows: List[VolExpiryRow] = []
+        source = ""
+
+        lse = self.lse.vol(ticker)
+        if lse and lse.get("expiries"):
+            source = "LSE"
+            spot = spot if spot is not None else lse.get("spot")
+            for e in lse["expiries"]:
+                rows.append(
+                    self._vol_row(
+                        expiry=str(e["expiry"]),
+                        dte=int(e["dte"]),
+                        strikes=e["strikes"],
+                        call_iv=e["call_iv"],
+                        put_iv=e["put_iv"],
+                        delta=e["delta"],
+                        gamma=e["gamma"],
+                        vega=e["vega"],
+                        spot=spot,
+                        tau=int(e["dte"]) / 365.0,
+                    )
+                )
+        else:
+            chains, _ = self.get_chain(ticker)
+            if not chains:
+                raise HTTPException(status_code=502, detail=f"no vol data for {ticker}")
+            source = "YF_CHAIN"
+            for c in chains:
+                rows.append(
+                    self._vol_row(
+                        expiry=c.expiry,
+                        dte=max(1, (datetime.strptime(c.expiry, "%Y-%m-%d").date() - date.today()).days),
+                        strikes=[float(s) for s in c.strikes.tolist()],
+                        call_iv=[float(v) for v in c.vol_calls.tolist()],
+                        put_iv=[float(v) for v in c.vol_puts.tolist()],
+                        delta=None,
+                        gamma=None,
+                        vega=None,
+                        spot=spot,
+                        tau=max(1, (datetime.strptime(c.expiry, "%Y-%m-%d").date() - date.today()).days) / 365.0,
+                    )
+                )
+        rows.sort(key=lambda r: r.dte)
+
+        term_structure = [VolTermPoint(expiry=r.expiry, dte=r.dte, atm_iv=r.atm_iv, skew_25=r.skew_25) for r in rows]
+
+        # ---- Deterministic signals -------------------------------------------------
+        hv30 = None
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(ticker).history(period="6mo")
+            if not hist.empty and len(hist) >= 30:
+                rets = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+                hv30 = float(np.sqrt(252.0) * np.std(rets.tail(30))) if len(rets) >= 10 else None
+        except Exception as exc:  # vol signals degrade gracefully
+            log.debug("hv30 unavailable for %s: %s", ticker, exc)
+
+        near = next((r for r in rows if r.atm_iv is not None), None)
+        far = next((r for r in reversed(rows) if r.atm_iv is not None), None)
+        iv_hv_premium = (near.atm_iv / hv30 - 1.0) if (near and hv30) else None
+        term_shape = "FLAT"
+        if near and far and near is not far:
+            diff = far.atm_iv - near.atm_iv
+            term_shape = "CONTANGO" if diff > 0.01 else "BACKWARDATION" if diff < -0.01 else "FLAT"
+
+        nearest_skew = near.skew_25 if near else None
+        skew_stress = "NEUTRAL_SKEW"
+        if nearest_skew is not None:
+            # skew_25 = put IV − call IV: positive ⇒ puts rich (equity norm)
+            skew_stress = "PUT_SKEW_STRESS" if nearest_skew > 0.05 else "CALL_SKEW_STRESS" if nearest_skew < -0.05 else "NEUTRAL_SKEW"
+        vol_regime = "FAIR"
+        if iv_hv_premium is not None:
+            vol_regime = "EXPENSIVE" if iv_hv_premium > 0.15 else "CHEAP" if iv_hv_premium < -0.05 else "FAIR"
+
+        payload = VolPayload(
+            ticker=ticker,
+            spot=spot,
+            as_of=datetime.now(timezone.utc).isoformat(),
+            source=source,
+            expiries=rows,
+            term_structure=term_structure,
+            signals=VolSignals(
+                hv30=hv30,
+                iv_hv_premium=iv_hv_premium,
+                term_shape=term_shape,
+                skew_stress=skew_stress,
+                vol_regime=vol_regime,
+            ),
+        )
+        self.vol_cache.set(ticker, payload)
+        return payload
 
     def get_news(self, ticker: str) -> List[NewsItem]:
         """Headline lane (Market Aux -> NewsAPI), 5-min cache."""
@@ -818,6 +1164,36 @@ def create_app() -> FastAPI:
         )
         state.flow_cache.set(cache_key, payload)
         return payload
+
+    @app.get(
+        "/api/v1/expiry_gex",
+        response_model=ExpiryGexPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit("60/minute", key_func=_rate_bucket)
+    def expiry_gex(
+        request: Request,
+        ticker: str = Query(default=DEFAULT_TICKER, description="Underlying for the GEX heatmap"),
+    ) -> ExpiryGexPayload:
+        symbol = ticker.strip().upper()
+        if not _TICKER_PATTERN.match(symbol):
+            raise HTTPException(status_code=400, detail=f"invalid ticker: {ticker!r}")
+        return state.get_expiry_gex(symbol)
+
+    @app.get(
+        "/api/v1/vol",
+        response_model=VolPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit("60/minute", key_func=_rate_bucket)
+    def vol(
+        request: Request,
+        ticker: str = Query(default=DEFAULT_TICKER, description="Underlying for the IV surface"),
+    ) -> VolPayload:
+        symbol = ticker.strip().upper()
+        if not _TICKER_PATTERN.match(symbol):
+            raise HTTPException(status_code=400, detail=f"invalid ticker: {ticker!r}")
+        return state.get_vol(symbol)
 
     return app
 

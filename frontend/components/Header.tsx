@@ -50,6 +50,8 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
       `▼ PUT WALL   $${formatPrice(data.put_wall)}  (${pct(data.put_wall)})`,
       `≈ 1σ MOVE    ±$${formatPrice(data.expected_move)}`,
       `≡ NET GEX    ${formatBig(data.net_gex)}`,
+      `▤ NET DEX    ${formatBig(data.net_dex)}`,
+      `⌁ NET VEX    ${formatBig(data.net_vex)}`,
       `◈ REGIME     ${regime}`,
       `━━━━━━━━━━━━━━━━━━━━━━━━━`,
     ].join("\n");

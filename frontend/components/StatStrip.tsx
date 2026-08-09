@@ -42,12 +42,24 @@ export default function StatStrip({ data }: StatStripProps) {
   );
 
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-8">
       <Tile
         label="Net GEX"
         value={data ? formatBig(data.net_gex) : "--"}
         sub="dealer gamma · 1% move"
         color="#38BDF8"
+      />
+      <Tile
+        label="Net DEX"
+        value={data ? formatBig(data.net_dex) : "--"}
+        sub="dealer delta · spot hedge"
+        color={data && data.net_dex < 0 ? "#60A5FA" : "#FBBF24"}
+      />
+      <Tile
+        label="Net VEX"
+        value={data ? formatBig(data.net_vex) : "--"}
+        sub="vanna · per vol point"
+        color="#A78BFA"
       />
       <Tile
         label="Call GEX"

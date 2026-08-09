@@ -77,6 +77,20 @@ VOLUME_WEIGHT = 0.7
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ExpiryGex:
+    """One expiry's own dollar-GEX grid (same S²·0.01·100 scale), kept for
+    the heatmap / expiry-breakdown views before the union-grid merge."""
+
+    expiry: str
+    dte_days: int
+    strikes: np.ndarray
+    gex: np.ndarray
+    oi_calls: np.ndarray
+    oi_puts: np.ndarray
+    iv: np.ndarray
+
+
+@dataclass
 class ExpiryChain:
     """One expiration's option chain — the engine's multi-expiry input unit.
 
@@ -112,12 +126,16 @@ def black_scholes_greeks(
     tau: float,
     sigma: np.ndarray,
     r: float = DEFAULT_RISK_FREE,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorized Black-Scholes (delta_call, delta_put, gamma) over a strike grid.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized Black-Scholes (delta_call, delta_put, gamma, vanna) over a strike grid.
 
     IV sanitation is handled here so the grid never produces NaNs: entries
     that are non-finite or non-positive are replaced with the median valid
     IV (or the fallback IV if none are valid).
+
+    Vanna (∂Δ/∂σ) is identical for call and put at a strike (like gamma);
+    closed form: Vanna = φ(d1)·(√τ − d1/σ), which satisfies the
+    ∂Δ/∂σ = ∂Vega/∂S cross-greek identity. It feeds dollar VEX exposure.
     """
     S = float(spot)
     K = np.asarray(strikes, dtype=np.float64)
@@ -143,13 +161,15 @@ def black_scholes_greeks(
     delta_call = stats.norm.cdf(d1)
     delta_put = delta_call - 1.0
     gamma = phi_d1 / (S * vol_t)
+    vanna = phi_d1 * (sqrt_tau - d1 / sig)
 
     # Pin any non-finite greek artefacts (e.g. degenerate strikes) to safe values
     gamma = np.where(np.isfinite(gamma), gamma, 0.0)
     delta_call = np.where(np.isfinite(delta_call), delta_call, 0.0)
     delta_put = np.where(np.isfinite(delta_put), delta_put, -1.0)
+    vanna = np.where(np.isfinite(vanna), vanna, 0.0)
 
-    return delta_call, delta_put, gamma
+    return delta_call, delta_put, gamma, vanna
 
 
 def _gamma_flip(
@@ -240,6 +260,11 @@ class GexResult:
     atm_iv: float
     net_gex: float
     regime: str
+    dex: np.ndarray       # dollar delta exposure per strike (net, puts negative)
+    vex: np.ndarray       # dollar vanna exposure per strike (net)
+    net_dex: float
+    net_vex: float
+    expiry_gex: list      # List[ExpiryGex] — per-expiry grids for heatmap views
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +348,12 @@ class QuantEngine:
 
             # Exact fractional-year DTE for THIS expiry (no hardcoded T)
             tau = _tau_years(ec.expiry)
-            _, _, gamma = black_scholes_greeks(spot, strikes, tau, iv, r)
+            delta_call, delta_put, gamma, vanna = black_scholes_greeks(spot, strikes, tau, iv, r)
 
             # Dollar-GEX scale — S^2 (IOF Masterclass M2); positive so
             # walls / flip are unaffected by units
             scale = spot * spot * MOVE_SIZE * CONTRACT_MULTIPLIER
+            dex_scale = spot * CONTRACT_MULTIPLIER
             per_expiry.append(
                 (
                     strikes,
@@ -336,8 +362,15 @@ class QuantEngine:
                     iv,
                     vol_calls,
                     vol_puts,
-                    gamma * oi_calls * scale,   # call-side dollar GEX
-                    gamma * oi_puts * scale,    # put-side dollar GEX (magnitude)
+                    gamma * oi_calls * scale,            # call-side dollar GEX
+                    gamma * oi_puts * scale,             # put-side dollar GEX (magnitude)
+                    delta_call * oi_calls * dex_scale,   # call-side dollar DEX
+                    delta_put * oi_puts * dex_scale,     # put-side dollar DEX (Δ_put < 0)
+                    vanna * oi_calls * dex_scale,        # call-side dollar VEX (per vol point)
+                    vanna * oi_puts * dex_scale,         # put-side dollar VEX
+                    int(max(0.0, (date.fromisoformat(ec.expiry) - date.today()).days))
+                    if ec.expiry
+                    else 0,
                 )
             )
 
@@ -356,7 +389,15 @@ class QuantEngine:
         vol_puts = np.zeros(n)
         gex_calls = np.zeros(n)
         gex_puts = np.zeros(n)
+        dex_calls = np.zeros(n)
+        dex_puts = np.zeros(n)
+        vex_calls = np.zeros(n)
+        vex_puts = np.zeros(n)
         iv_mat = np.full((len(per_expiry), n), np.nan)
+
+        # Per-expiry dollar-GEX grids (own-tau gamma, same scale) for the
+        # heatmap / expiry-breakdown views — captured before the merge
+        expiry_gex: List[ExpiryGex] = []
 
         for i, g in enumerate(per_expiry):
             p = pos[i]
@@ -367,12 +408,40 @@ class QuantEngine:
             vol_puts[p] += g[5]
             gex_calls[p] += g[6]
             gex_puts[p] += g[7]
+            dex_calls[p] += g[8]
+            dex_puts[p] += g[9]
+            vex_calls[p] += g[10]
+            vex_puts[p] += g[11]
+
+            # Per-expiry dollar-GEX grid, reindexed onto the union axis —
+            # the expiry's own strikes land exactly on `grid` via searchsorted
+            gex_exp = np.zeros(n)
+            gex_exp[p] = g[6] - g[7]
+            oi_calls_exp = np.zeros(n)
+            oi_calls_exp[p] = g[1]
+            oi_puts_exp = np.zeros(n)
+            oi_puts_exp[p] = g[2]
+            iv_exp = np.zeros(n)
+            iv_exp[p] = g[3]
+            expiry_gex.append(
+                ExpiryGex(
+                    expiry=str(expiries[i].expiry),
+                    dte_days=int(g[12]),
+                    strikes=grid,
+                    gex=gex_exp,
+                    oi_calls=oi_calls_exp,
+                    oi_puts=oi_puts_exp,
+                    iv=iv_exp,
+                )
+            )
 
         # Cross-expiry mean IV per strike (missing months -> NaN, ignored)
         iv = np.nanmean(iv_mat, axis=0)
         iv = np.where(np.isfinite(iv) & (iv > 0.0), iv, FALLBACK_IV)
 
         gex = gex_calls - gex_puts
+        dex = dex_calls + dex_puts
+        vex = vex_calls + vex_puts
         cum_gex = np.cumsum(gex)
 
         # Walls = peak dollar-GEX strikes (not raw contract counts):
@@ -415,6 +484,11 @@ class QuantEngine:
             atm_iv=atm_iv,
             net_gex=net_gex_total,
             regime=regime,
+            dex=dex,
+            vex=vex,
+            net_dex=float(dex.sum()),
+            net_vex=float(vex.sum()),
+            expiry_gex=expiry_gex,
         )
 
 

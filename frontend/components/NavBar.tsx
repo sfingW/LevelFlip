@@ -7,6 +7,10 @@ import { BoltIcon } from "@/components/icons";
 const LINKS = [
   { href: "/", label: "Home" },
   { href: "/terminal", label: "Terminal" },
+  { href: "/heatmap", label: "Heatmap" },
+  { href: "/chain", label: "Chain" },
+  { href: "/vol", label: "Vol" },
+  { href: "/flow", label: "Flow" },
 ];
 
 /** Shared top navigation: brand + page links, sticky across pages. */

@@ -62,3 +62,84 @@ body::before {
   background: #334155;
   border-radius: 3px;
 }
+
+/* ---- restrained motion: rise, grow, pulse — nothing gratuitous ---- */
+
+/* sections fade + lift in on mount (stagger via .rise-delay-N) */
+@keyframes lf-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: lf-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.rise-delay-1 {
+  animation-delay: 0.06s;
+}
+.rise-delay-2 {
+  animation-delay: 0.12s;
+}
+.rise-delay-3 {
+  animation-delay: 0.18s;
+}
+
+/* value bars (GEX/DEX/VEX ladders, heatmap cells) grow from the baseline */
+@keyframes lf-grow-x {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+.animate-grow-x {
+  transform-origin: left center;
+  animation: lf-grow-x 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* live-readout heartbeat — a breathing glow, not a strobe */
+@keyframes lf-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0);
+  }
+  50% {
+    box-shadow: 0 0 12px 0 rgba(56, 189, 248, 0.25);
+  }
+}
+.animate-breathe {
+  animation: lf-breathe 3.2s ease-in-out infinite;
+}
+
+/* value-change flash: re-keyed node pulses once (counters, spot) */
+@keyframes lf-flash {
+  0% {
+    background: rgba(245, 158, 11, 0.22);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.animate-flash {
+  animation: lf-flash 0.9s ease-out both;
+  border-radius: 4px;
+}
+
+/* heatmap cells fade in staggered left->right so the grid "draws" */
+@keyframes lf-cell-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-cell-in {
+  animation: lf-cell-in 0.4s ease-out both;
+}

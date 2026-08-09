@@ -1,8 +1,8 @@
 /**
  * LevelFlip API contract — mirrors the FastAPI Pydantic models verbatim
- * (backend/main.py: GexBar, IOFPayload, AnalystNote, CandleBar, CandlesPayload).
- * Field-for-field parity is a constitutional rule — do not rename without
- * updating the backend models.
+ * (backend/main.py: GexBar, IOFPayload, AnalystNote, CandleBar, CandlesPayload,
+ * ExpiryGex*, Vol*). Field-for-field parity is a constitutional rule — do not
+ * rename without updating the backend models.
  */
 
 export interface GexBar {
@@ -11,6 +11,8 @@ export interface GexBar {
   oi_calls: number;
   oi_puts: number;
   iv: number;
+  dex: number; // dollar delta exposure (dealers), puts counted negative
+  vex: number; // dollar vanna exposure per vol point
 }
 
 export interface AnalystNote {
@@ -31,6 +33,8 @@ export interface IOFPayload {
   expected_move: number;
   atm_iv: number;
   net_gex: number;
+  net_dex: number; // dealer dollar delta exposure
+  net_vex: number; // dealer dollar vanna exposure (per vol point)
   regime: string; // "LONG_GAMMA" | "SHORT_GAMMA" — total net GEX sign
   market_state: string; // "open" | "pre_market" | "post_market" | "closed"
   chain_stale: boolean;
@@ -60,6 +64,8 @@ export interface FlowPrint {
   volume: number | null;
   side: string | null;
   timestamp: string;
+  dte: number | null;
+  delta: number | null;
 }
 
 export interface FlowPayload {
@@ -80,4 +86,71 @@ export interface CandlesPayload {
   ticker: string;
   interval: string;
   candles: CandleBar[];
+}
+
+export interface ExpiryGexRow {
+  expiry: string;
+  dte: number;
+  strikes: number[];
+  gex: number[];
+  oi_calls: number[];
+  oi_puts: number[];
+  iv: number[];
+}
+
+export interface ExpiryBreakdownRow {
+  bucket: string; // "0DTE" | "WEEKLY" | "MONTHLY" | "LEAPS"
+  expiry: string;
+  dte: number;
+  dollar_gex: number;
+  oi_calls: number;
+  oi_puts: number;
+  pct: number; // share of total dollar GEX
+}
+
+export interface ExpiryGexPayload {
+  ticker: string;
+  spot: number;
+  as_of: string;
+  breakdown: ExpiryBreakdownRow[];
+  expiries: ExpiryGexRow[];
+}
+
+export interface VolExpiryRow {
+  expiry: string;
+  dte: number;
+  strikes: number[];
+  call_iv: (number | null)[];
+  put_iv: (number | null)[];
+  delta: (number | null)[];
+  gamma: (number | null)[];
+  vega: (number | null)[];
+  atm_iv: number | null;
+  atm_strike: number | null;
+  skew_25: number | null; // 25Δ put IV − 25Δ call IV
+}
+
+export interface VolTermPoint {
+  expiry: string;
+  dte: number;
+  atm_iv: number | null;
+  skew_25: number | null;
+}
+
+export interface VolSignals {
+  hv30: number | null;
+  iv_hv_premium: number | null; // atm_iv / hv30 − 1
+  term_shape: string; // "BACKWARDATION" | "CONTANGO" | "FLAT"
+  skew_stress: string; // "PUT_SKEW_STRESS" | "CALL_SKEW_STRESS" | "NEUTRAL_SKEW"
+  vol_regime: string; // "EXPENSIVE" | "CHEAP" | "FAIR"
+}
+
+export interface VolPayload {
+  ticker: string;
+  spot: number | null;
+  as_of: string;
+  source: string;
+  expiries: VolExpiryRow[];
+  term_structure: VolTermPoint[];
+  signals: VolSignals;
 }

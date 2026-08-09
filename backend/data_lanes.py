@@ -90,18 +90,33 @@ class ChainData:
 class LSEChainFetcher:
     """Options chain via London Strategic Edge (lse-data).
 
-    Returns ChainData rows per expiry when the payload includes open interest
-    (GEX needs OI). If the API contract lacks OI fields, or the key is invalid
-    (401), the lane degrades to None and the caller falls through to the next
-    chain lane. Invalid keys trip a cooldown so we stop paying for them.
+    The LSE chain (one row per contract) carries IV, delta, gamma, vega and
+    premium — but NO open interest, so it cannot anchor GEX (OI math). Its
+    roles here:
+
+      fetch()  -> OI-gated GEX-anchor lane. Probes the schema once per
+                  process; the LSE chain has no OI fields, so it returns None
+                  and the GEX anchor falls through to AV/yfinance. If LSE
+                  ever adds OI, the probe re-enables it automatically.
+      vol()    -> rich per-expiry grids (iv/delta/gamma/vega/premium) for the
+                  vol-surface endpoint. This is the live IV source.
+
+    The vault ignores min_dte/max_dte on the chain endpoint and returns rows
+    from the *oldest* expiries in the store, so near-term expiries are
+    fetched explicitly — one call per upcoming Friday (weekly + monthly
+    cycles), merged and cached per ticker for 5 minutes.
     """
 
     label = "lse"
+    ROWS_TTL_SECONDS = 300.0
 
     def __init__(self) -> None:
         self._client = None
         self._client_lock = threading.Lock()
-        self._key = os.getenv("LSE_API_KEY") or os.getenv("London_STRATEGIC_EDGE_API_KEY")
+        self._key = _lse_key()
+        self._rows_cache: Dict[str, tuple] = {}   # ticker -> (fetched_ts, rows)
+        self._rows_lock = threading.Lock()
+        self._oi_absent = False
 
     def _lse(self):
         if self._client is not None:
@@ -113,52 +128,97 @@ class LSEChainFetcher:
                 self._client = LSE(api_key=self._key) if self._key else None
         return self._client
 
-    def fetch(self, ticker: str) -> Optional[List[ChainData]]:
-        if not self._key:
-            log.info("LSE lane: no API key configured — skipping")
-            return None
+    @staticmethod
+    def _upcoming_fridays(count: int = 8) -> List[str]:
+        """Next `count` expiry dates — SPY weeklies/monthlies fall on Fridays."""
+        import datetime as _dt
+        today = _dt.date.today()
+        days_ahead = (4 - today.weekday()) % 7  # Friday
+        first = today + _dt.timedelta(days=days_ahead or 7)
+        return [(first + _dt.timedelta(weeks=i)).isoformat() for i in range(count)]
+
+    def _fetch_rows(self, ticker: str) -> Optional[List[dict]]:
+        """All near-term LSE chain rows for a ticker (per-Friday calls, cached)."""
+        with self._rows_lock:
+            cached = self._rows_cache.get(ticker)
+            if cached and time.time() - cached[0] < self.ROWS_TTL_SECONDS:
+                return cached[1]
         if _COOLDOWNS.blocked(f"lse:{ticker}"):
             return None
         client = self._lse()
         if client is None:
             return None
-        try:
-            rows = client.options(ticker, max_dte=60, limit=5000)
-            if not rows:
-                return None
-        except Exception as exc:  # 401 / 429 / timeout — park the lane
-            log.warning("LSE chain failed for %s: %s — cooling down", ticker, exc)
-            _COOLDOWNS.trip(f"lse:{ticker}")
-            return None
 
-        first = rows[0]
-        oi_key = _pick_key(first, ("open_interest", "openInterest", "oi"))
-        iv_key = _pick_key(first, ("implied_volatility", "impliedVolatility", "iv"))
-        vol_key = _pick_key(first, ("volume", "vol"))
+        merged: List[dict] = []
+        failures = 0
+        for expiry in self._upcoming_fridays():
+            try:
+                rows = client.options(ticker, expiry=expiry, limit=5000) or []
+                # Keep only the fields the engine consumes — trims ~40k dicts to
+                # a manageable footprint
+                for r in rows:
+                    merged.append(
+                        {
+                            "strike": r.get("strike"),
+                            "expiry": str(r.get("expiry", ""))[:10],
+                            "dte": r.get("dte"),
+                            "contract_type": str(r.get("contract_type") or "").lower(),
+                            "iv": r.get("iv"),
+                            "delta": r.get("delta"),
+                            "gamma": r.get("gamma"),
+                            "vega": r.get("vega"),
+                            "last_price": r.get("last_price"),
+                            "premium_today": r.get("premium_today"),
+                            "underlying_price": r.get("underlying_price"),
+                        }
+                    )
+            except Exception:
+                failures += 1
+        if not merged:
+            if failures:
+                log.warning("LSE chain failed for %s (%d expiries) — cooling down", ticker, failures)
+                _COOLDOWNS.trip(f"lse:{ticker}")
+            return None
+        with self._rows_lock:
+            self._rows_cache[ticker] = (time.time(), merged)
+        log.info("LSE chain: %d rows (%d expiries, %d failed) for %s", len(merged), len(self._upcoming_fridays()) - failures, failures, ticker)
+        return merged
+
+    # -- GEX-anchor lane (OI-gated) ---------------------------------------
+
+    def fetch(self, ticker: str) -> Optional[List[ChainData]]:
+        if not self._key:
+            return None
+        if self._oi_absent:
+            return None  # schema probed once — no OI, cannot anchor GEX
+        rows = self._fetch_rows(ticker)
+        if not rows:
+            return None
+        oi_key = _pick_key(rows[0], ("open_interest", "openInterest", "oi"))
         if oi_key is None:
-            log.warning(
-                "LSE chain for %s has no open interest field (keys: %s) — cannot compute GEX, falling through",
-                ticker,
-                sorted(first.keys()),
+            self._oi_absent = True
+            log.info(
+                "LSE chain has no open interest field (keys: %s) — GEX anchor falls through; "
+                "LSE feeds the vol surface instead",
+                sorted(rows[0].keys()),
             )
             return None
-
+        # Schema has OI (future-proofing): build ChainData per expiry
         by_expiry: Dict[str, dict] = {}
         for row in rows:
             exp = str(row.get("expiry") or row.get("expiration") or "").split("T")[0]
             if not exp:
                 continue
-            right = str(row.get("type") or row.get("right") or "").lower()
-            strike = row.get("strike")
+            right = str(row.get("type") or row.get("contract_type") or row.get("right") or "").lower()
             try:
-                strike = float(strike)
+                strike = float(row.get("strike"))
             except (TypeError, ValueError):
                 continue
             bucket = by_expiry.setdefault(exp, {"strike": [], "calls": {}, "puts": {}, "iv": {}, "vol": {}})
             bucket["strike"].append(strike)
             oi = _num(row.get(oi_key), 0.0)
-            iv = _num(row.get(iv_key), 0.0) if iv_key else 0.0
-            vol = _num(row.get(vol_key), 0.0) if vol_key else 0.0
+            iv = _num(row.get("iv"), 0.0)
+            vol = _num(row.get("volume_today") or row.get("volume"), 0.0)
             if right == "call":
                 bucket["calls"][strike] = oi
                 bucket["iv"][strike] = iv
@@ -171,17 +231,78 @@ class LSEChainFetcher:
         chains: List[ChainData] = []
         for exp, b in sorted(by_expiry.items()):
             strikes = np.array(sorted(set(b["strike"])), dtype=np.float64)
-            oic = np.array([b["calls"].get(s, 0.0) for s in strikes], dtype=np.float64)
-            oip = np.array([b["puts"].get(s, 0.0) for s in strikes], dtype=np.float64)
-            iv = np.array([b["iv"].get(s, 0.0) for s in strikes], dtype=np.float64)
-            voc = np.array([b["vol"].get(s, 0.0) for s in strikes], dtype=np.float64)
-            vop = np.zeros_like(voc)
             chains.append(
-                ChainData(ticker=ticker, expiry=exp, strikes=strikes, oi_calls=oic,
-                          oi_puts=oip, vol_calls=voc, vol_puts=vop, iv=iv)
+                ChainData(
+                    ticker=ticker,
+                    expiry=exp,
+                    strikes=strikes,
+                    oi_calls=np.array([b["calls"].get(s, 0.0) for s in strikes], dtype=np.float64),
+                    oi_puts=np.array([b["puts"].get(s, 0.0) for s in strikes], dtype=np.float64),
+                    vol_calls=np.array([b["vol"].get(s, 0.0) for s in strikes], dtype=np.float64),
+                    vol_puts=np.zeros(len(strikes)),
+                    iv=np.array([b["iv"].get(s, 0.0) for s in strikes], dtype=np.float64),
+                )
             )
-        log.info("LSE chain: %d expiries for %s", len(chains), ticker)
         return chains or None
+
+    # -- Vol surface feed (live IV + greeks, OI-free) ----------------------
+
+    def vol(self, ticker: str) -> Optional[dict]:
+        """Per-expiry grids for the vol surface: strikes x {iv, delta, gamma, vega}."""
+        if not self._key:
+            return None
+        rows = self._fetch_rows(ticker)
+        if not rows:
+            return None
+        spot = next((_num(r.get("underlying_price"), None) for r in rows if r.get("underlying_price")), None)
+
+        by_expiry: Dict[str, dict] = {}
+        for r in rows:
+            exp = str(r.get("expiry", ""))[:10]
+            if not exp:
+                continue
+            try:
+                strike = float(r.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            b = by_expiry.setdefault(
+                exp,
+                {"dte": _num(r.get("dte"), 0), "calls": {}, "puts": {}},
+            )
+            side = b["calls"] if r.get("contract_type") == "call" else b["puts"]
+            side[strike] = {
+                "iv": _num(r.get("iv"), None),
+                "delta": _num(r.get("delta"), None),
+                "gamma": _num(r.get("gamma"), None),
+                "vega": _num(r.get("vega"), None),
+                "premium": _num(r.get("premium_today"), 0.0),
+            }
+
+        expiries = []
+        for exp, b in sorted(by_expiry.items()):
+            strikes = sorted(set(b["calls"]) | set(b["puts"]))
+            if not strikes:
+                continue
+            expiries.append(
+                {
+                    "expiry": exp,
+                    "dte": int(b["dte"]),
+                    "strikes": strikes,
+                    "call_iv": [b["calls"].get(s, {}).get("iv") for s in strikes],
+                    "put_iv": [b["puts"].get(s, {}).get("iv") for s in strikes],
+                    "delta": [b["calls"].get(s, {}).get("delta") for s in strikes],
+                    "gamma": [
+                        b["calls"].get(s, {}).get("gamma") or b["puts"].get(s, {}).get("gamma")
+                        for s in strikes
+                    ],
+                    "vega": [b["calls"].get(s, {}).get("vega") for s in strikes],
+                    "premium": [b["calls"].get(s, {}).get("premium", 0.0) for s in strikes],
+                }
+            )
+        if not expiries:
+            return None
+        log.info("LSE vol surface: %d expiries for %s", len(expiries), ticker)
+        return {"spot": spot, "expiries": expiries}
 
 
 class AlphaVantageChainFetcher:
@@ -479,7 +600,7 @@ class LSEOptionsFlow:
 
     def __init__(self) -> None:
         self._client = None
-        self._key = os.getenv("LSE_API_KEY") or os.getenv("London_STRATEGIC_EDGE_API_KEY")
+        self._key = _lse_key()
 
     def _lse(self):
         if self._client is not None:
@@ -506,14 +627,16 @@ class LSEOptionsFlow:
             out.append(
                 {
                     "contract": r.get("contract") or r.get("ticker") or "",
-                    "type": str(r.get("type") or r.get("right") or "").upper(),
+                    "type": str(r.get("contract_type") or r.get("type") or r.get("right") or "").upper(),
                     "strike": _num(r.get("strike"), None),
                     "expiry": str(r.get("expiry") or r.get("expiration") or "")[:10],
                     "premium": _num(r.get("premium"), 0.0),
-                    "price": _num(r.get("price") or r.get("trade_price"), None),
+                    "price": _num(r.get("price") or r.get("last_price") or r.get("trade_price"), None),
                     "volume": _num(r.get("volume") or r.get("size"), 0),
                     "side": str(r.get("side") or r.get("option_side") or "").upper() or None,
-                    "timestamp": str(r.get("timestamp") or r.get("time") or "")[:19],
+                    "timestamp": str(r.get("ts") or r.get("timestamp") or r.get("time") or "")[:19],
+                    "dte": _num(r.get("dte"), None),
+                    "delta": _num(r.get("delta"), None),
                 }
             )
         return out
@@ -522,6 +645,15 @@ class LSEOptionsFlow:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _lse_key() -> Optional[str]:
+    """Live key first (lse_live_...), then the legacy placeholders."""
+    return (
+        os.getenv("London_STRATEGIC_EDGE_API_KEY_LIVE")
+        or os.getenv("LSE_API_KEY")
+        or os.getenv("London_STRATEGIC_EDGE_API_KEY")
+    )
+
 
 def _pick_key(row: dict, candidates: tuple) -> Optional[str]:
     for k in candidates:

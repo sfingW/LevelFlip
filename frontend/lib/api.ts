@@ -1,8 +1,10 @@
 import useSWR from "swr";
 import type {
+  ExpiryGexPayload,
   FlowPayload,
   IOFPayload,
   NewsPayload,
+  VolPayload,
 } from "@/types/levelFlip";
 
 /** Override with NEXT_PUBLIC_API_URL if the backend is not on localhost:8000. */
@@ -64,6 +66,34 @@ export function useFlowData(ticker: string, minPremium = 100_000, refreshMs = 30
     revalidateOnFocus: true,
     errorRetryCount: 2,
   });
+}
+
+/** Per-expiry GEX heatmap + 0DTE/Weekly/Monthly breakdown — 30s poll. */
+export function useExpiryGex(ticker: string, refreshMs = 30_000) {
+  return useSWR<ExpiryGexPayload>(
+    `${API_BASE}/api/v1/expiry_gex?ticker=${encodeURIComponent(ticker)}`,
+    fetcher,
+    {
+      refreshInterval: refreshMs,
+      revalidateOnFocus: true,
+      errorRetryCount: 2,
+      keepPreviousData: true,
+    }
+  );
+}
+
+/** IV surface (smiles + term structure + signals) — 5-min poll (300s backend cache). */
+export function useVolData(ticker: string, refreshMs = 300_000) {
+  return useSWR<VolPayload>(
+    `${API_BASE}/api/v1/vol?ticker=${encodeURIComponent(ticker)}`,
+    fetcher,
+    {
+      refreshInterval: refreshMs,
+      revalidateOnFocus: true,
+      errorRetryCount: 2,
+      keepPreviousData: true,
+    }
+  );
 }
 
 export function formatPrice(value: number): string {
