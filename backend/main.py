@@ -23,6 +23,7 @@ Routes:
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import re
@@ -32,16 +33,31 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from datetime import time as dtime
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
+from data_lanes import (
+    AlphaVantageChainFetcher,
+    FallbackChainFetcher,
+    FallbackNewsFetcher,
+    FinnhubSpotFeed,
+    FMPSpotFeed,
+    LSEChainFetcher,
+    LSEOptionsFlow,
+    NewsItem,
+)
 from llm_analyst import AnalystNote, LLMAnalyst
 from quant_engine import ExpiryChain, LockedTTLCache, QuantEngine
 
@@ -60,6 +76,22 @@ DEFAULT_TICKER = os.getenv("DEFAULT_TICKER", "SPY")
 # Futures that only CBOE (not yfinance) can serve delayed quotes for
 FUTURES_TICKERS = {"ES", "NQ", "YM", "RTY", "MES", "MNQ", "M2K", "MYM"}
 
+# Static API-key auth (X-API-Key header). The frontend ships this key in its
+# bundle (SPA reality) — auth is a throttle on casual drainers, not a vault.
+LEVELFLIP_API_KEY = os.getenv("LEVELFLIP_API_KEY", "")
+
+# Rate limiting — keyed clients share one bucket so the polling UI never
+# trips it. Anonymous traffic never reaches the limiter: require_api_key
+# rejects it first (401), which is the real LLM-quota protection. ANON_IOF_RATE
+# is kept as the documented ceiling if the auth wall is ever removed in dev.
+ANON_IOF_RATE = os.getenv("ANON_IOF_RATE", "10/minute")
+KEYED_IOF_RATE = os.getenv("KEYED_IOF_RATE", "60/minute")
+
+# US equity market sessions (America/New_York). Holidays are approximated by
+# weekday only — the market_state field is advisory, not a settlement calendar.
+ET = ZoneInfo("America/New_York")
+PRE_OPEN, REG_OPEN, REG_CLOSE, POST_CLOSE = (4, 0), (9, 30), (16, 0), (20, 0)
+
 # Cache geometry — all cachetools.TTLCache, in-memory, no DBs
 SPOT_TTL_SECONDS = 1.0
 CHAIN_TTL_SECONDS = 3600.0          # anchor lifetime (morning OI)
@@ -67,6 +99,8 @@ CHAIN_REFRESH_SECONDS = 1800.0      # lazily re-anchor after 30 min
 CHAIN_STALE_AFTER_SECONDS = 5400.0  # flag payloads served from an old anchor
 PAYLOAD_TTL_SECONDS = 2.0
 CANDLES_TTL_SECONDS = 30.0          # 1-minute bars only change once a minute
+NEWS_TTL_SECONDS = 300.0            # headline feed (matches analyst cache TTL)
+FLOW_TTL_SECONDS = 30.0             # options prints
 
 _TICKER_PATTERN = re.compile(r"^[A-Z0-9._^/-]{1,12}$")
 
@@ -95,9 +129,40 @@ class IOFPayload(BaseModel):
     atm_iv: float
     net_gex: float
     regime: str
+    market_state: str  # "open" | "pre_market" | "post_market" | "closed"
     chain_stale: bool
     gex_profile: List[GexBar]
     analysis: Optional[AnalystNote] = None
+
+
+class NewsArticle(BaseModel):
+    title: str
+    source: str
+    url: str
+    published_at: str
+
+
+class NewsPayload(BaseModel):
+    ticker: str
+    articles: List[NewsArticle]
+
+
+class FlowPrint(BaseModel):
+    contract: str
+    type: str
+    strike: Optional[float]
+    expiry: str
+    premium: float
+    price: Optional[float]
+    volume: int
+    side: Optional[str]
+    timestamp: str
+
+
+class FlowPayload(BaseModel):
+    ticker: str
+    min_premium: float
+    prints: List[FlowPrint]
 
 
 class CandleBar(BaseModel):
@@ -112,6 +177,44 @@ class CandlesPayload(BaseModel):
     ticker: str
     interval: str
     candles: List[CandleBar]
+
+
+# ---------------------------------------------------------------------------
+# Auth & rate limiting
+# ---------------------------------------------------------------------------
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """Reject requests without a valid X-API-Key (constant-time compare)."""
+    if not LEVELFLIP_API_KEY:
+        return  # auth disabled when no key configured — local dev only
+    if not x_api_key or not hmac.compare_digest(x_api_key, LEVELFLIP_API_KEY):
+        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
+
+
+def _rate_bucket(request: Request) -> str:
+    """Keyed clients share one wide bucket (UI polling); anon get per-IP buckets."""
+    key = request.headers.get("x-api-key")
+    if key and LEVELFLIP_API_KEY and hmac.compare_digest(key, LEVELFLIP_API_KEY):
+        return "keyed-client"
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=get_remote_address, enabled=os.getenv("RATE_LIMIT_ENABLED", "1") != "0")
+
+
+def _market_state(now: Optional[datetime] = None) -> str:
+    """US equity session state for the current time (ET, weekday-approximated)."""
+    now = now or datetime.now(ET)
+    if now.weekday() >= 5:  # Sat/Sun
+        return "closed"
+    hm = now.time()
+    if dtime(*PRE_OPEN) <= hm < dtime(*REG_OPEN):
+        return "pre_market"
+    if dtime(*REG_OPEN) <= hm < dtime(*REG_CLOSE):
+        return "open"
+    if dtime(*REG_CLOSE) <= hm < dtime(*POST_CLOSE):
+        return "post_market"
+    return "closed"
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +305,18 @@ class CBOEFuturesSpotFeed(SpotFeed):
 
 
 class SpotPoller:
-    """Single background thread polling all watched tickers every second."""
+    """Single background thread polling all watched tickers every second.
+
+    Each ticker class maps to an ordered list of candidate feeds; the first
+    feed that returns a price wins (futures: CBOE -> Finnhub -> FMP;
+    equities/ETFs: Finnhub -> FMP -> yfinance).
+    """
 
     def __init__(self, spot_cache: LockedTTLCache, interval: float = 1.0) -> None:
         self._cache = spot_cache
         self._interval = interval
-        self._equity_feed = YFinanceSpotFeed()
-        self._futures_feed = CBOEFuturesSpotFeed()
+        self._equity_feeds: List[SpotFeed] = [FinnhubSpotFeed(), FMPSpotFeed(), YFinanceSpotFeed()]
+        self._futures_feeds: List[SpotFeed] = [CBOEFuturesSpotFeed(), FinnhubSpotFeed(), FMPSpotFeed()]
         self._watched: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -225,18 +333,26 @@ class SpotPoller:
             if ticker not in self._watched:
                 self._watched[ticker] = 0.0
 
-    def _feed_for(self, ticker: str) -> SpotFeed:
-        return self._futures_feed if ticker in FUTURES_TICKERS else self._equity_feed
+    def _feeds_for(self, ticker: str) -> List[SpotFeed]:
+        return self._futures_feeds if ticker in FUTURES_TICKERS else self._equity_feeds
+
+    @staticmethod
+    def _first_price(feeds: List[SpotFeed], ticker: str) -> Optional[float]:
+        for feed in feeds:
+            try:
+                price = feed.fetch(ticker)
+            except Exception:
+                price = None
+            if price is not None and price > 0:
+                return price
+        return None
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             with self._lock:
                 tickers = list(self._watched)
             for ticker in tickers:
-                try:
-                    price = self._feed_for(ticker).fetch(ticker)
-                except Exception:
-                    price = None
+                price = self._first_price(self._feeds_for(ticker), ticker)
                 if price is not None and price > 0:
                     self._cache.set(ticker, price)
                     with self._lock:
@@ -248,7 +364,7 @@ class SpotPoller:
         price = self._cache.get(ticker)
         if price is not None:
             return price
-        price = self._feed_for(ticker).fetch(ticker)
+        price = self._first_price(self._feeds_for(ticker), ticker)
         if price is not None and price > 0:
             self._cache.set(ticker, price)
         return price
@@ -362,8 +478,16 @@ class LevelFlipApp:
         self.chain_cache = LockedTTLCache(maxsize=32, ttl=CHAIN_TTL_SECONDS)
         self.payload_cache = LockedTTLCache(maxsize=256, ttl=PAYLOAD_TTL_SECONDS)
         self.candles_cache = LockedTTLCache(maxsize=32, ttl=CANDLES_TTL_SECONDS)
+        self.news_cache = LockedTTLCache(maxsize=64, ttl=NEWS_TTL_SECONDS)
+        self.flow_cache = LockedTTLCache(maxsize=32, ttl=FLOW_TTL_SECONDS)
         self.poller = SpotPoller(self.spot_cache)
-        self.chain_fetcher = YFinanceChainFetcher()
+        # Chain anchor lanes: LSE (chain+greeks) -> Alpha Vantage (EOD OI
+        # baseline, 25/day budget) -> yfinance (today's default).
+        self.chain_fetcher = FallbackChainFetcher(
+            [LSEChainFetcher(), AlphaVantageChainFetcher(), YFinanceChainFetcher()]
+        )
+        self.news_fetcher = FallbackNewsFetcher()
+        self.flow_fetcher = LSEOptionsFlow()
         self._chain_locks: Dict[str, threading.Lock] = {}
         self._chain_locks_guard = threading.Lock()
         self.started_at = time.time()
@@ -445,6 +569,7 @@ class LevelFlipApp:
 
         analysis = None
         if include_analysis:
+            headlines = self.get_news(ticker)
             analysis = self.analyst.generate(
                 ticker=ticker,
                 spot=spot,
@@ -455,6 +580,7 @@ class LevelFlipApp:
                 expected_move=result.expected_move,
                 net_gex=result.net_gex,
                 regime=result.regime,
+                news_headlines=headlines,
             )
 
         return IOFPayload(
@@ -469,10 +595,20 @@ class LevelFlipApp:
             atm_iv=result.atm_iv,
             net_gex=result.net_gex,
             regime=result.regime,
+            market_state=_market_state(),
             chain_stale=stale,
             gex_profile=profile,
             analysis=analysis,
         )
+
+    def get_news(self, ticker: str) -> List[NewsItem]:
+        """Headline lane (Market Aux -> NewsAPI), 5-min cache."""
+        cached = self.news_cache.get(ticker)
+        if cached is not None:
+            return cached
+        items = self.news_fetcher.fetch(ticker=ticker, limit=5)
+        self.news_cache.set(ticker, items)
+        return items
 
     def get_candles(
         self, ticker: str, interval: str = "1m", period: str = "1d"
@@ -541,10 +677,13 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="LevelFlip Terminal API",
-        version="1.0.0",
+        version="2.0.0",
         description="Institutional dealer positioning / GEX microservice (hybrid OI anchor + live spot)",
         lifespan=lifespan,
     )
+
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     origins = [
         o.strip()
@@ -570,10 +709,18 @@ def create_app() -> FastAPI:
             "uptime_seconds": round(time.time() - state.started_at, 1),
             "payload_cache_ttl": PAYLOAD_TTL_SECONDS,
             "watched_tickers": sorted(list(state.poller._watched)),  # noqa: SLF001
+            "market_state": _market_state(),
+            "auth_required": bool(LEVELFLIP_API_KEY),
         }
 
-    @app.get("/api/v1/iof", response_model=IOFPayload)
+    @app.get(
+        "/api/v1/iof",
+        response_model=IOFPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit(KEYED_IOF_RATE, key_func=_rate_bucket)
     def iof(
+        request: Request,
         ticker: str = Query(
             default=DEFAULT_TICKER,
             description="Equity/ETF (SPY, QQQ, NVDA) or futures (ES, NQ, YM, RTY)",
@@ -596,8 +743,14 @@ def create_app() -> FastAPI:
         state.payload_cache.set(cache_key, payload)
         return payload
 
-    @app.get("/api/v1/candles", response_model=CandlesPayload)
+    @app.get(
+        "/api/v1/candles",
+        response_model=CandlesPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit("120/minute", key_func=_rate_bucket)
     def candles(
+        request: Request,
         ticker: str = Query(default=DEFAULT_TICKER, description="Equity/ETF or futures (ES, NQ)"),
         interval: str = Query(default="1m", description="Bar size"),
         period: str = Query(default="1d", description="Lookback window"),
@@ -610,6 +763,61 @@ def create_app() -> FastAPI:
         if period not in {"1d", "5d", "1mo", "3mo", "6mo", "1y"}:
             raise HTTPException(status_code=400, detail=f"invalid period: {period!r}")
         return state.get_candles(symbol, interval, period)
+
+    @app.get(
+        "/api/v1/news",
+        response_model=NewsPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit("30/minute", key_func=_rate_bucket)
+    def news(
+        request: Request,
+        ticker: str = Query(default="", description="Ticker to filter headlines on — omit for the broad market feed"),
+    ) -> NewsPayload:
+        symbol = ticker.strip().upper()
+        if symbol and not _TICKER_PATTERN.match(symbol):
+            raise HTTPException(status_code=400, detail=f"invalid ticker: {ticker!r}")
+        items = state.get_news(symbol or None)
+        return NewsPayload(
+            ticker=symbol or "MARKET",
+            articles=[
+                NewsArticle(title=it.title, source=it.source, url=it.url, published_at=it.published_at)
+                for it in items
+            ],
+        )
+
+    @app.get(
+        "/api/v1/flow",
+        response_model=FlowPayload,
+        dependencies=[Depends(require_api_key)],
+    )
+    @limiter.limit("30/minute", key_func=_rate_bucket)
+    def flow(
+        request: Request,
+        ticker: str = Query(default=DEFAULT_TICKER, description="Underlying for options flow"),
+        min_premium: float = Query(default=100_000.0, description="Minimum print premium"),
+    ) -> FlowPayload:
+        symbol = ticker.strip().upper()
+        if not _TICKER_PATTERN.match(symbol):
+            raise HTTPException(status_code=400, detail=f"invalid ticker: {ticker!r}")
+        cache_key = f"{symbol}:{min_premium}"
+        cached = state.flow_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        prints = state.flow_fetcher.fetch(symbol, min_premium=min_premium)
+        if not prints:
+            raise HTTPException(
+                status_code=502,
+                detail="options flow unavailable — LSE key invalid, missing, or lane cooling down",
+            )
+        payload = FlowPayload(
+            ticker=symbol,
+            min_premium=min_premium,
+            prints=[FlowPrint(**p) for p in prints],
+        )
+        state.flow_cache.set(cache_key, payload)
+        return payload
 
     return app
 

@@ -96,6 +96,9 @@ DATA:
 - Net GEX: {net_gex}
 - Dealer regime (total net GEX): {regime}
 
+LATEST HEADLINES (use only if directly relevant to the above; never invent headlines):
+{news_headlines}
+
 GROUND-TRUTH REGIME (computed by the system — do NOT re-derive, NEVER contradict):
 - Relation: {relation}
 - Your signal MUST be one of: {family}
@@ -146,6 +149,7 @@ class LLMAnalyst:
         expected_move: float,
         net_gex: float,
         regime: str,
+        news_headlines: Optional[list] = None,
     ) -> AnalystNote:
         """Return a cached briefing, or synthesize one (live -> static)."""
         cached = self._cache.get(ticker)
@@ -153,7 +157,8 @@ class LLMAnalyst:
             return cached
 
         note = self._generate_live(
-            ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex, regime
+            ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex, regime,
+            news_headlines,
         )
         if note is None:
             note = self._generate_static(
@@ -162,6 +167,20 @@ class LLMAnalyst:
 
         self._cache.set(ticker, note)
         return note
+
+    @staticmethod
+    def _headline_block(headlines: Optional[list]) -> str:
+        """Compact "- title (source, date)" lines, or an empty placeholder."""
+        if not headlines:
+            return "- (no recent headlines)"
+        lines = []
+        for h in headlines:
+            title = getattr(h, "title", None) or (h.get("title") if isinstance(h, dict) else None) or ""
+            source = getattr(h, "source", None) or ""
+            stamp = getattr(h, "published_at", None) or ""
+            suffix = ", ".join(x for x in (source, stamp) if x)
+            lines.append(f"- {title} ({suffix})" if suffix else f"- {title}")
+        return "\n".join(lines) or "- (no recent headlines)"
 
     # -- live path --------------------------------------------------------
 
@@ -181,6 +200,7 @@ class LLMAnalyst:
         expected_move: float,
         net_gex: float,
         regime: str,
+        news_headlines: Optional[list] = None,
     ) -> Optional[AnalystNote]:
         if not _HAS_OPENAI:
             return None
@@ -196,6 +216,7 @@ class LLMAnalyst:
             expected_move=f"{expected_move:,.2f}",
             net_gex=f"{net_gex:,.0f}",
             regime=regime,
+            news_headlines=self._headline_block(news_headlines),
             relation=relation,
             family=family,
             direction=direction,

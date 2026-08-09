@@ -10,6 +10,10 @@ __pycache__/
 .venv/
 venv/
 
+# runtime logs (dev servers)
+*.out.log
+*.err.log
+
 # node
 node_modules/
 .next/

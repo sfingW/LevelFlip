@@ -32,9 +32,40 @@ export interface IOFPayload {
   atm_iv: number;
   net_gex: number;
   regime: string; // "LONG_GAMMA" | "SHORT_GAMMA" — total net GEX sign
+  market_state: string; // "open" | "pre_market" | "post_market" | "closed"
   chain_stale: boolean;
   gex_profile: GexBar[];
   analysis: AnalystNote | null;
+}
+
+export interface NewsArticle {
+  title: string;
+  source: string;
+  url: string;
+  published_at: string;
+}
+
+export interface NewsPayload {
+  ticker: string;
+  articles: NewsArticle[];
+}
+
+export interface FlowPrint {
+  contract: string;
+  type: string; // "CALL" | "PUT"
+  strike: number | null;
+  expiry: string;
+  premium: number;
+  price: number | null;
+  volume: number | null;
+  side: string | null;
+  timestamp: string;
+}
+
+export interface FlowPayload {
+  ticker: string;
+  min_premium: number;
+  prints: FlowPrint[];
 }
 
 export interface CandleBar {

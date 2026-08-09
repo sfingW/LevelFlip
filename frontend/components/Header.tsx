@@ -78,20 +78,6 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
     <header className="flex flex-col gap-4">
       {/* topbar: brand + actions */}
       <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-flip to-orange-600 text-slate-950 shadow-[0_0_18px_rgba(245,158,11,0.45)]">
-            <BoltIcon className="h-5 w-5" />
-          </div>
-          <div>
-            <div className="text-lg font-black leading-none tracking-tight text-slate-100">
-              LEVEL<span className="text-flip">FLIP</span>
-            </div>
-            <div className="mt-0.5 text-[9px] uppercase tracking-[0.28em] text-slate-500">
-              Dealer positioning terminal
-            </div>
-          </div>
-        </div>
-
         <div className="flex items-center gap-2.5">
           {/* regime badge */}
           <span
