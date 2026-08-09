@@ -27,6 +27,9 @@ export interface IOFPayload {
   call_wall: number;
   put_wall: number;
   gamma_flip: number;
+  max_pain: number;
+  expected_move: number;
+  atm_iv: number;
   net_gex: number;
   chain_stale: boolean;
   gex_profile: GexBar[];

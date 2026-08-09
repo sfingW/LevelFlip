@@ -91,6 +91,8 @@ DATA:
 - Call Wall (short-gamma resistance): {call_wall}
 - Put Wall (long-gamma support): {put_wall}
 - LevelFlip / Zero-Gamma pivot: {gamma_flip}
+- Max Pain (OPEX pin magnet): {max_pain}
+- Expected Move (1σ band, ±): {expected_move}
 - Net GEX: {net_gex}
 
 GROUND-TRUTH REGIME (computed by the system — do NOT re-derive, NEVER contradict):
@@ -139,6 +141,8 @@ class LLMAnalyst:
         call_wall: float,
         put_wall: float,
         gamma_flip: float,
+        max_pain: float,
+        expected_move: float,
         net_gex: float,
     ) -> AnalystNote:
         """Return a cached briefing, or synthesize one (live -> static)."""
@@ -146,9 +150,13 @@ class LLMAnalyst:
         if cached is not None:
             return cached
 
-        note = self._generate_live(ticker, spot, call_wall, put_wall, gamma_flip, net_gex)
+        note = self._generate_live(
+            ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex
+        )
         if note is None:
-            note = self._generate_static(ticker, spot, call_wall, put_wall, gamma_flip, net_gex)
+            note = self._generate_static(
+                ticker, spot, call_wall, put_wall, gamma_flip, max_pain, expected_move, net_gex
+            )
 
         self._cache.set(ticker, note)
         return note
@@ -167,6 +175,8 @@ class LLMAnalyst:
         call_wall: float,
         put_wall: float,
         gamma_flip: float,
+        max_pain: float,
+        expected_move: float,
         net_gex: float,
     ) -> Optional[AnalystNote]:
         if not _HAS_OPENAI:
@@ -179,6 +189,8 @@ class LLMAnalyst:
             call_wall=f"{call_wall:,.2f}",
             put_wall=f"{put_wall:,.2f}",
             gamma_flip=f"{gamma_flip:,.2f}",
+            max_pain=f"{max_pain:,.2f}",
+            expected_move=f"{expected_move:,.2f}",
             net_gex=f"{net_gex:,.0f}",
             relation=relation,
             family=family,
@@ -265,6 +277,8 @@ class LLMAnalyst:
         call_wall: float,
         put_wall: float,
         gamma_flip: float,
+        max_pain: float,
+        expected_move: float,
         net_gex: float,
     ) -> AnalystNote:
         band = max(abs(spot) * 0.001, 0.05)  # 0.1% pin band around the pivot

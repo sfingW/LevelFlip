@@ -1,6 +1,6 @@
 # LevelFlip ⚡
 
-Institutional dealer-positioning terminal: live **Gamma Exposure (GEX)**, Call Wall, Put Wall, and Zero-Gamma (LevelFlip) pivot — built on a zero-cost hybrid data pipeline.
+Institutional dealer-positioning terminal: live **dollar Gamma Exposure (GEX)**, Call Wall / Put Wall, Zero-Gamma (LevelFlip) pivot, **Max Pain** and **Expected Move** — built on a zero-cost hybrid data pipeline, per the IOF Derivation Masterclass methodology.
 
 ## Architecture
 
@@ -9,21 +9,24 @@ Institutional dealer-positioning terminal: live **Gamma Exposure (GEX)**, Call W
 │  OCC Chain  │ ────────────────────────────► │  quant_engine.py │
 │  OI / Vol / │                               │  vectorized BS Γ  │
 │  IV (cached)│                               └────────┬─────────┘
-└─────────────┘                                        │ GEX / walls / flip
-┌─────────────┐  1s spot poller                       ▼
+└─────────────┘                                        │ GEX / walls / flip /
+┌─────────────┐  1s spot poller                       │ max pain / EM / ATM IV
 │  Spot feed  │ ───────────────────────────►  FastAPI (TTLCache 2s)
 │ yfinance /  │                                /api/v1/iof?ticker=SPY
 │ CBOE futures│                                /api/v1/candles
 └─────────────┘                                └────────┬─────────┘
 ┌─────────────┐  Groq → Gemini → static                │
-│ LLM Analyst │ ─────────────────────────────►  Next.js 14 bento UI
-└─────────────┘                                (SWR 2s · lightweight-charts · recharts)
+│ LLM Analyst │ ─────────────────────────────►  Next.js 15 terminal
+└─────────────┘                                (SWR 2s · custom SVG, no chart lib)
 ```
 
 - **Anchor:** options chain (strikes/OI/volume/IV) fetched from yfinance, cached in `cachetools.TTLCache`, lazily re-anchored.
 - **Catalyst:** 1-second spot polling — yfinance fast-info for equities/ETFs (SPY, QQQ, NVDA), CBOE public delayed JSON for futures (ES, NQ, YM, RTY).
-- **Math:** fully vectorized Black-Scholes gamma over the strike grid (NumPy/SciPy, no loops): `GEX = Γ · (OIc − OIp) · S · 0.01 · 100`; walls from cumulative-GEX extremes; zero-gamma flip via nearest-crossing interpolation.
-- **AI brief:** provider-agnostic desk briefing (Groq primary, Gemini fallback, static rule-based last) with a deterministic spot-vs-pivot truth guard. 5-minute per-ticker cache.
+- **Math (fully vectorized, NumPy/SciPy, zero Python loops):**
+  - **Dollar GEX** (masterclass form): `GEX = Γ · (OIc − OIp) · S² · 0.01 · 100` — walls from cumulative-GEX extremes, zero-gamma flip via nearest-crossing interpolation.
+  - **Max Pain:** `L(K) = Σ OIc·(K−Kj) + Σ OIp·(Kj−K)`, argmin over the grid — vectorized with cumulative sums.
+  - **Expected Move:** `EM = S · σ_ATM · √(DTE/365)` from the ATM IV.
+- **AI brief:** provider-agnostic desk briefing (Groq primary, Gemini fallback, static rule-based last) with a deterministic spot-vs-pivot truth guard, enriched with Max Pain & Expected Move context. 5-minute per-ticker cache.
 - **Zero external databases.** All state is in-memory TTLCache.
 
 ## Quickstart
@@ -59,6 +62,9 @@ Override the API origin with `NEXT_PUBLIC_API_URL` if the backend isn't on `loca
   "call_wall": 545.00,
   "put_wall": 538.00,
   "gamma_flip": 541.50,
+  "max_pain": 542.00,
+  "expected_move": 4.32,
+  "atm_iv": 0.1781,
   "net_gex": 123456789.12,
   "chain_stale": false,
   "gex_profile": [
@@ -68,14 +74,16 @@ Override the API origin with `NEXT_PUBLIC_API_URL` if the backend isn't on `loca
 }
 ```
 
-`GET /api/v1/candles?ticker=SPY&interval=1m&period=1d` → OHLC bar array for the chart canvas.
+`GET /api/v1/candles?ticker=SPY&interval=1m&period=1d` → OHLC bar array (kept for clients; the terminal renders its own SVG).
 
 ## Design language
 
-Slate dark (`#0B0E14` canvas / `#1E293B` cards), bento grid, zero text walls:
-- **Call Wall** — neon red `#EF4444` (short-gamma resistance)
-- **Put Wall** — neon green `#22C55E` (long-gamma support)
-- **LevelFlip / Zero Gamma** — electric amber `#F59E0B`
+Dark terminal (`#0B0E14` canvas), glass cards, ambient glow field + film grain, Inter + JetBrains Mono (next/font). One screen, one truth:
+- **IOF Battle Map** — hand-built SVG (no chart lib): GEX histogram by strike around the zero line, ±1σ expected-move band, structural hairlines (Call Wall / LevelFlip / Max Pain / Put Wall), pulsing live spot, right-rail key, dealer-regime banner.
+- **Stat strip** — Net / Call / Put GEX, Max Pain, 1σ Move, ATM IV at a glance.
+- **Tactical ladder** — masterclass Module 4 execution matrix: per-level dealer mechanic + the one trade that works there.
+- **AI desk brief** — signal badge + one-sentence read, provider-stamped.
+- Custom SVG glyphs only (no default emojis): Call Wall `#EF4444` · Put Wall `#22C55E` · LevelFlip `#F59E0B` · Max Pain `#A78BFA` · 1σ `#38BDF8`.
 
 Regime badge (LONG GAMMA ⇄ SHORT GAMMA) is deterministic; ⚡ SHARE SETUP copies a dark-mode-ready setup to the clipboard.
 

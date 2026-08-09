@@ -11,10 +11,13 @@ const config: Config = {
         callwall: "#EF4444",
         putwall: "#22C55E",
         flip: "#F59E0B",
+        maxpain: "#A78BFA",
+        emmove: "#38BDF8",
         muted: "#94A3B8",
       },
       fontFamily: {
-        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
+        sans: ["var(--font-inter)", "ui-sans-serif", "system-ui", "sans-serif"],
+        mono: ["var(--font-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
       },
       keyframes: {
         "badge-green": {

@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { formatBig, formatPrice } from "@/lib/api";
+import { BoltIcon } from "@/components/icons";
 import type { IOFPayload } from "@/types/levelFlip";
+
+const QUICK_TICKERS = ["SPY", "ES", "NQ", "QQQ", "NVDA", "IWM"];
 
 interface HeaderProps {
   ticker: string;
@@ -32,17 +35,23 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
 
   const share = useCallback(async () => {
     if (!data) return;
+    const pct = (k: number) => {
+      const p = ((k - data.spot_price) / data.spot_price) * 100;
+      return `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
+    };
     const regime = data.spot_price >= data.gamma_flip ? "LONG GAMMA" : "SHORT GAMMA";
     const text = [
-      `⚡ LEVELFLIP — ${data.ticker} SETUP`,
-      `━━━━━━━━━━━━━━━━━`,
-      `📊 SPOT: $${formatPrice(data.spot_price)}`,
-      `🔴 CALL WALL: $${formatPrice(data.call_wall)}`,
-      `🟠 LEVELFLIP: $${formatPrice(data.gamma_flip)}`,
-      `🟢 PUT WALL: $${formatPrice(data.put_wall)}`,
-      `🧲 NET GEX: ${formatBig(data.net_gex)}`,
-      `💀 REGIME: ${regime}`,
-      `━━━━━━━━━━━━━━━━━`,
+      `◆ LEVELFLIP — ${data.ticker} IOF SETUP`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      `▲ SPOT       $${formatPrice(data.spot_price)}`,
+      `■ CALL WALL  $${formatPrice(data.call_wall)}  (${pct(data.call_wall)})`,
+      `⇄ LEVELFLIP  $${formatPrice(data.gamma_flip)}  (${pct(data.gamma_flip)})`,
+      `★ MAX PAIN   $${formatPrice(data.max_pain)}`,
+      `▼ PUT WALL   $${formatPrice(data.put_wall)}  (${pct(data.put_wall)})`,
+      `≈ 1σ MOVE    ±$${formatPrice(data.expected_move)}`,
+      `≡ NET GEX    ${formatBig(data.net_gex)}`,
+      `◈ REGIME     ${regime}`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━`,
     ].join("\n");
     try {
       await navigator.clipboard.writeText(text);
@@ -57,7 +66,7 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
       document.execCommand("copy");
       document.body.removeChild(ta);
     }
-    setToast("⚡ Setup copied to clipboard");
+    setToast("Setup copied — paste it anywhere");
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 2200);
   }, [data]);
@@ -67,57 +76,32 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
   const longGamma = spot !== undefined && flip !== undefined && spot >= flip;
 
   return (
-    <header className="flex flex-col gap-3 border-b border-edge pb-4 md:flex-row md:items-center md:justify-between">
-      {/* brand + ticker search */}
-      <div className="flex items-center gap-4">
-        <div className="text-2xl font-black tracking-tight text-slate-100">
-          LEVEL<span className="text-flip">FLIP</span>
+    <header className="flex flex-col gap-4">
+      {/* topbar: brand + actions */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-flip to-orange-600 text-slate-950 shadow-[0_0_18px_rgba(245,158,11,0.45)]">
+            <BoltIcon className="h-5 w-5" />
+          </div>
+          <div>
+            <div className="text-lg font-black leading-none tracking-tight text-slate-100">
+              LEVEL<span className="text-flip">FLIP</span>
+            </div>
+            <div className="mt-0.5 text-[9px] uppercase tracking-[0.28em] text-slate-500">
+              Dealer positioning terminal
+            </div>
+          </div>
         </div>
-        <form onSubmit={submit} className="flex items-center gap-2">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value.toUpperCase())}
-            placeholder="SPY / ES / NVDA"
-            spellCheck={false}
-            autoComplete="off"
-            className="w-28 rounded-lg border border-edge bg-canvas px-3 py-1.5 font-mono text-sm uppercase tracking-wider text-slate-100 outline-none placeholder:text-slate-500 focus:border-flip/60 md:w-32"
-          />
-          <button
-            type="submit"
-            className="rounded-lg border border-edge bg-card px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-slate-300 hover:border-flip/60 hover:text-flip"
-          >
-            Go
-          </button>
-        </form>
-      </div>
 
-      {/* spot / regime / share */}
-      <div className="flex flex-wrap items-center gap-4">
-        <div className="flex items-center gap-4">
-          {/* live spot */}
-          <div>
-            <div className="level-label">Spot</div>
-            <div className="font-mono text-xl font-bold tabular-nums text-slate-100">
-              {spot !== undefined ? `$${formatPrice(spot)}` : loading ? "…" : "--"}
-            </div>
-          </div>
-
-          {/* net GEX */}
-          <div>
-            <div className="level-label">Net GEX</div>
-            <div className="font-mono text-xl font-bold tabular-nums text-slate-100">
-              {data ? formatBig(data.net_gex) : "--"}
-            </div>
-          </div>
-
-          {/* pulsing regime badge */}
+        <div className="flex items-center gap-2.5">
+          {/* regime badge */}
           <span
             title={
               longGamma
                 ? "Price above zero-gamma pivot — dealer flow dampens volatility"
                 : "Price below zero-gamma pivot — dealer flow accelerates volatility"
             }
-            className={`rounded-md px-2.5 py-1 text-[11px] font-bold uppercase tracking-widest ${
+            className={`hidden rounded-md px-2.5 py-1 text-[11px] font-bold uppercase tracking-widest sm:inline-block ${
               longGamma ? "animate-badge-green" : "animate-badge-red"
             }`}
             style={{
@@ -128,39 +112,101 @@ export default function Header({ ticker, onTickerChange, data, loading, error }:
             {longGamma ? "◆ Long Gamma" : "▼ Short Gamma"}
           </span>
 
-          {/* LLM signal chip — hover for the desk brief (no text walls) */}
+          {/* LLM signal chip — hover for the desk brief */}
           {data?.analysis && (
             <span
               title={data.analysis.summary}
-              className="hidden cursor-help rounded-md border border-edge bg-card px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 sm:inline-block"
+              className="hidden cursor-help rounded-md border border-edge bg-white/[0.04] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 lg:inline-block"
             >
               {data.analysis.signal}
             </span>
           )}
-        </div>
 
-        {/* primary CTA */}
-        <button
-          onClick={share}
-          disabled={!data}
-          className="animate-glow-amber rounded-lg bg-flip px-4 py-2 text-sm font-bold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:animate-none disabled:opacity-40"
-        >
-          ⚡ SHARE SETUP
-        </button>
+          {/* the one action that matters */}
+          <button
+            onClick={share}
+            disabled={!data}
+            className="animate-glow-amber flex items-center gap-1.5 rounded-lg bg-flip px-4 py-2 text-sm font-bold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:animate-none disabled:opacity-40"
+          >
+            <BoltIcon className="h-4 w-4" />
+            SHARE SETUP
+          </button>
+        </div>
       </div>
 
-      {/* connection state dots */}
-      <span
-        className="absolute right-4 top-4 h-2 w-2 rounded-full"
-        style={{
-          background: error ? "#EF4444" : loading && !data ? "#F59E0B" : "#22C55E",
-        }}
-        title={error ? `API error: ${error.message}` : loading && !data ? "connecting…" : "live"}
-      />
+      {/* hero row: zero-friction ticker + live desk numbers */}
+      <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+        <div>
+          <form onSubmit={submit} className="flex items-center gap-2">
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value.toUpperCase())}
+              placeholder="SPY / ES / NVDA"
+              spellCheck={false}
+              autoComplete="off"
+              className="w-40 rounded-lg border border-edge bg-white/[0.04] px-3 py-2 font-mono text-base uppercase tracking-wider text-slate-100 outline-none placeholder:text-slate-500 focus:border-flip/60"
+            />
+            <button
+              type="submit"
+              className="rounded-lg border border-edge bg-white/[0.05] px-3.5 py-2 text-xs font-semibold uppercase tracking-wider text-slate-200 transition hover:border-flip/60 hover:text-flip"
+            >
+              Go
+            </button>
+          </form>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {QUICK_TICKERS.map((t) => (
+              <button
+                key={t}
+                onClick={() => onTickerChange(t)}
+                className={`chip ${t === ticker ? "chip-active" : ""}`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-end gap-6">
+          <div>
+            <div className="level-label flex items-center gap-1.5">
+              <span className="relative flex h-1.5 w-1.5">
+                <span
+                  className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 ${
+                    error ? "bg-red-400" : "bg-green-400"
+                  }`}
+                />
+                <span
+                  className={`relative inline-flex h-1.5 w-1.5 rounded-full ${
+                    error ? "bg-red-400" : "bg-green-400"
+                  }`}
+                />
+              </span>
+              {error ? "Spot · degraded" : "Spot · live"}
+            </div>
+            <div className="font-mono text-5xl font-black tabular-nums tracking-tight text-slate-50">
+              {spot !== undefined ? `$${formatPrice(spot)}` : loading ? "…" : "--"}
+            </div>
+          </div>
+          <div className="flex gap-6 pb-1">
+            <div>
+              <div className="level-label">Net GEX</div>
+              <div className="font-mono text-xl font-bold tabular-nums text-slate-100">
+                {data ? formatBig(data.net_gex) : "--"}
+              </div>
+            </div>
+            <div>
+              <div className="level-label">1σ Move</div>
+              <div className="font-mono text-xl font-bold tabular-nums text-slate-100">
+                {data ? `±$${formatPrice(data.expected_move)}` : "--"}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* clipboard toast */}
       {toast && (
-        <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-flip/40 bg-card px-4 py-2 text-sm font-medium text-flip shadow-xl">
+        <div className="fixed bottom-5 left-1/2 z-[60] -translate-x-1/2 rounded-lg border border-flip/40 bg-card px-4 py-2 text-sm font-medium text-flip shadow-xl">
           {toast}
         </div>
       )}

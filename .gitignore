@@ -22,3 +22,6 @@ out/
 # misc
 .DS_Store
 Thumbs.db
+
+# reference material — proprietary Quant paper, never commit
+research/

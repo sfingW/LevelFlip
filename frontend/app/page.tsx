@@ -1,19 +1,20 @@
 "use client";
 
 import { useState } from "react";
-import GexProfileChart from "@/components/GexProfileChart";
+import DeskBrief from "@/components/DeskBrief";
 import Header from "@/components/Header";
-import MetricCards from "@/components/MetricCards";
-import TradingViewChart from "@/components/TradingViewChart";
-import { useCandles, useIOFData } from "@/lib/api";
+import IofMap from "@/components/IofMap";
+import StatStrip from "@/components/StatStrip";
+import TacticalLadder from "@/components/TacticalLadder";
+import { useIOFData } from "@/lib/api";
 
 export default function Page() {
   const [ticker, setTicker] = useState("SPY");
   const { data, isLoading, error } = useIOFData(ticker);
-  const { data: candles } = useCandles(ticker);
+  const longGamma = data ? data.spot_price >= data.gamma_flip : null;
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-7xl flex-col gap-4 p-4">
+    <main className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-3 px-4 pb-4 pt-5">
       <Header
         ticker={ticker}
         onTickerChange={setTicker}
@@ -22,35 +23,43 @@ export default function Page() {
         error={error}
       />
 
-      {/* bento grid — mobile first: 1 col, md: levels row + chart/profile */}
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <div className="md:col-span-3">
-          <MetricCards data={data} />
-        </div>
+      <StatStrip data={data} />
 
-        <div className="card h-[400px] md:col-span-2">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="level-label">Price Action — 1m</span>
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-              {data ? `${data.ticker} · live spot overlay` : "connecting…"}
-            </span>
-          </div>
-          <TradingViewChart candles={candles?.candles} data={data} />
-        </div>
+      <section className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <IofMap data={data} />
 
-        <div className="card h-[400px]">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="level-label">Net GEX by Strike</span>
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-              ±5% window
-            </span>
+        <div className="flex flex-col gap-3">
+          <DeskBrief data={data} />
+
+          {/* dealer regime — one screen, one truth */}
+          <div className="card flex flex-1 flex-col justify-center">
+            <div className="level-label">Dealer Regime</div>
+            {longGamma === null ? (
+              <div className="mt-2 h-8 w-40 animate-pulse rounded bg-white/[0.06]" />
+            ) : (
+              <>
+                <div
+                  className={`mt-1 font-mono text-3xl font-black tracking-tight ${
+                    longGamma ? "text-green-400" : "text-red-400"
+                  }`}
+                >
+                  {longGamma ? "LONG GAMMA" : "SHORT GAMMA"}
+                </div>
+                <p className="mt-2 text-xs leading-relaxed text-slate-400">
+                  {longGamma
+                    ? "Dealers buy dips and sell rallies above the pivot — volatility is dampened, pullbacks get absorbed."
+                    : "Dealers are forced to sell into drops and buy into surges below the pivot — volatility expands, breakdowns accelerate."}
+                </p>
+              </>
+            )}
           </div>
-          <GexProfileChart data={data} />
         </div>
       </section>
 
-      <footer className="pb-2 text-center text-[10px] uppercase tracking-widest text-slate-600">
-        LevelFlip — dealer gamma positioning · futures quotes delayed
+      <TacticalLadder data={data} />
+
+      <footer className="pb-2 pt-1 text-center text-[10px] uppercase tracking-widest text-slate-600">
+        LevelFlip — dealer gamma positioning · futures quotes delayed · not investment advice
       </footer>
     </main>
   );

@@ -8,19 +8,45 @@
 
 body {
   background-color: #0b0e14;
+  /* ambient glow field — renders as "lit terminal", not flat black */
+  background-image:
+    radial-gradient(1100px 560px at 88% -12%, rgba(56, 189, 248, 0.07), transparent 62%),
+    radial-gradient(900px 520px at -12% 8%, rgba(245, 158, 11, 0.06), transparent 60%),
+    radial-gradient(700px 420px at 50% 115%, rgba(167, 139, 250, 0.05), transparent 60%);
+  background-attachment: fixed;
   color: #e2e8f0;
   -webkit-font-smoothing: antialiased;
 }
 
+/* subtle film grain so flat surfaces read as rendered, not default */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
 @layer components {
   .card {
-    @apply rounded-xl border border-edge bg-card p-4;
+    @apply relative rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4;
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+      0 18px 40px -24px rgba(0, 0, 0, 0.85);
   }
   .level-label {
     @apply text-[10px] font-semibold uppercase tracking-widest text-muted;
   }
   .level-price {
     @apply font-mono text-2xl font-bold tabular-nums;
+  }
+  .chip {
+    @apply rounded-md border border-edge/70 px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider text-slate-400 transition hover:border-flip/50 hover:text-flip;
+  }
+  .chip-active {
+    @apply border-flip/70 bg-flip/10 text-flip;
   }
 }
 

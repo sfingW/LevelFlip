@@ -90,6 +90,9 @@ class IOFPayload(BaseModel):
     call_wall: float
     put_wall: float
     gamma_flip: float
+    max_pain: float
+    expected_move: float
+    atm_iv: float
     net_gex: float
     chain_stale: bool
     gex_profile: List[GexBar]
@@ -428,6 +431,8 @@ class LevelFlipApp:
                 call_wall=result.call_wall,
                 put_wall=result.put_wall,
                 gamma_flip=result.gamma_flip,
+                max_pain=result.max_pain,
+                expected_move=result.expected_move,
                 net_gex=result.net_gex,
             )
 
@@ -438,6 +443,9 @@ class LevelFlipApp:
             call_wall=result.call_wall,
             put_wall=result.put_wall,
             gamma_flip=result.gamma_flip,
+            max_pain=result.max_pain,
+            expected_move=result.expected_move,
+            atm_iv=result.atm_iv,
             net_gex=result.net_gex,
             chain_stale=stale,
             gex_profile=profile,

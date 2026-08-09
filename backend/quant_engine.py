@@ -8,11 +8,14 @@ Clean-room reimplementation (clean of GPL/unlicensed sources) of the
 vectorized GEX approach used by zrack/gex-terminal (MIT) and
 erma0x/gexxer (Apache-2.0). Formulas follow market convention:
 
-    GEX_k = Gamma_k * (OI_call,k - OI_put,k) * S * 0.01 * 100
+    GEX_k = Gamma_k * (OI_call,k - OI_put,k) * S^2 * 0.01 * 100
 
   - Gamma_k : Black-Scholes gamma at strike k (identical for call & put)
   - OI      : open interest with dealer convention — puts counted negative
               (dealers are structurally long the put hedge, short the call)
+  - S^2     : dollar-GEX form — S^2 = S * S converts share-gamma to dollar
+              exposure per 1% move (IOF Masterclass Module 2). Positive
+              scaling, so walls / gamma-flip are unaffected vs share-GEX.
   - 0.01    : 1% spot move convention (SPX/SPY GEX reporting)
   - 100     : equity/index contract multiplier
 
@@ -28,6 +31,10 @@ Outputs:
   - gamma_flip  : zero-gamma "LevelFlip" pivot — linear interpolation of
                   the cumulative-GEX zero crossing, nearest crossing to
                   spot when several exist
+  - max_pain    : strike minimizing total buyer payout at expiry (OPEX pin
+                  magnet) — vectorized via cumulative-sum decomposition
+  - expected_move : 1σ move container S * σ_ATM * sqrt(T) (68% band)
+  - atm_iv      : ATM implied vol (strike nearest spot)
   - gex_profile : per-strike net GEX array (serialized in the API layer)
 """
 
@@ -161,6 +168,45 @@ def _walls_and_gamma_flip(
     return call_wall, put_wall, gamma_flip
 
 
+def _max_pain_strike(
+    strikes: np.ndarray,
+    oi_calls: np.ndarray,
+    oi_puts: np.ndarray,
+) -> float:
+    """Max Pain strike — minimizes total option-buyer payout at expiry:
+
+        L(K_i) = Σ_{K_j<K_i} OIc_j·(K_i−K_j) + Σ_{K_j>K_i} OIp_j·(K_j−K_i)
+
+    Each sum decomposes into K·ΣOI − Σ(OI·K), so both tails collapse to
+    cumulative sums — fully vectorized, no per-strike Python loop.
+    """
+    K = strikes
+    # calls below the candidate strike: K_i·ΣOIc_lt − Σ(OIc_lt·K)
+    c_lt = np.cumsum(oi_calls) - oi_calls
+    s_lt = np.cumsum(oi_calls * K) - oi_calls * K
+    call_loss = K * c_lt - s_lt
+    # puts above the candidate strike: Σ(OIp_gt·K) − K_i·ΣOIp_gt
+    c_gt = np.cumsum(oi_puts[::-1])[::-1] - oi_puts
+    s_gt = np.cumsum((oi_puts * K)[::-1])[::-1] - oi_puts * K
+    put_loss = s_gt - K * c_gt
+
+    loss = call_loss + put_loss
+    return float(K[int(np.argmin(loss))])
+
+
+def _atm_iv_and_move(
+    spot: float,
+    tau: float,
+    iv: np.ndarray,
+    strikes: np.ndarray,
+) -> Tuple[float, float]:
+    """ATM IV (strike nearest spot) and the 1σ expected move S·σ_ATM·√T."""
+    atm_idx = int(np.argmin(np.abs(strikes - spot)))
+    atm_iv = float(iv[atm_idx])
+    expected_move = spot * atm_iv * math.sqrt(max(tau, MIN_TAU_YEARS))
+    return atm_iv, expected_move
+
+
 # ---------------------------------------------------------------------------
 # Output container
 # ---------------------------------------------------------------------------
@@ -183,6 +229,9 @@ class GexResult:
     call_wall: float
     put_wall: float
     gamma_flip: float
+    max_pain: float
+    expected_move: float
+    atm_iv: float
     net_gex: float
 
 
@@ -269,12 +318,17 @@ class QuantEngine:
 
         _, _, gamma = black_scholes_greeks(spot, strikes, tau, iv, r)
 
-        # Per-strike dealer GEX: gamma * net dealer OI * spot * 1% * multiplier
+        # Per-strike dealer GEX — dollar form (IOF Masterclass M2):
+        # gamma * net dealer OI * S^2 * 1% * multiplier
         net_oi = oi_calls - oi_puts
-        gex = gamma * net_oi * spot * MOVE_SIZE * CONTRACT_MULTIPLIER
+        gex = gamma * net_oi * spot * spot * MOVE_SIZE * CONTRACT_MULTIPLIER
 
         cum_gex = np.cumsum(gex)
         call_wall, put_wall, gamma_flip = _walls_and_gamma_flip(strikes, cum_gex, spot)
+
+        # Max Pain + 1σ expected move (paper M2 §4-§5) — both vectorized
+        max_pain = _max_pain_strike(strikes, oi_calls, oi_puts)
+        atm_iv, expected_move = _atm_iv_and_move(spot, tau, iv, strikes)
 
         # Weighted wall-strength heuristic (OI*0.3 + Volume*0.7), vectorized
         wall_score_calls = oi_calls * OI_WEIGHT + vol_calls * VOLUME_WEIGHT
@@ -295,6 +349,9 @@ class QuantEngine:
             call_wall=call_wall,
             put_wall=put_wall,
             gamma_flip=gamma_flip,
+            max_pain=max_pain,
+            expected_move=expected_move,
+            atm_iv=atm_iv,
             net_gex=float(gex.sum()),
         )
 
