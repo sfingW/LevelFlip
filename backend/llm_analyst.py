@@ -93,17 +93,33 @@ DATA:
 - LevelFlip / Zero-Gamma pivot: {gamma_flip}
 - Net GEX: {net_gex}
 
-INTERPRETATION RULES:
-1. FIRST derive the spot-vs-pivot relation precisely: if spot > gamma_flip, the market trades
-   ABOVE the pivot in long-gamma; if spot < gamma_flip, BELOW it in short-gamma. This relation
-   dominates every choice below. Never contradict it in the summary.
-2. Above the zero-gamma pivot: BULLISH_DRIFT / BULLISH_ABSORPTION / CALL_WALL_RESISTANCE.
-   Below the zero-gamma pivot: BEARISH_PRESSURE / BEARISH_ABSORPTION / PUT_WALL_SUPPORT.
-3. signal MUST be exactly one of: BULLISH_ABSORPTION, BEARISH_ABSORPTION, BULLISH_DRIFT,
+GROUND-TRUTH REGIME (computed by the system — do NOT re-derive, NEVER contradict):
+- Relation: {relation}
+- Your signal MUST be one of: {family}
+- Your summary MUST describe spot as trading {direction} the pivot. The opposite is an error.
+- If you cannot write a summary consistent with the relation, signal MUST be NEUTRAL.
+
+RULES:
+1. signal MUST be exactly one of: BULLISH_ABSORPTION, BEARISH_ABSORPTION, BULLISH_DRIFT,
    BEARISH_PRESSURE, CALL_WALL_RESISTANCE, PUT_WALL_SUPPORT, PINNED, NEUTRAL.
-4. summary: 2-3 sentences, desk tone, numbers only from the data above, no boilerplate disclaimers.
+2. summary: 2-3 sentences, desk tone, numbers only from the data above, no boilerplate disclaimers.
 
 Reply with ONLY a JSON object: {{"signal": "...", "summary": "..."}}"""
+
+
+def _regime_context(spot: float, gamma_flip: float):
+    """Precompute the spot-vs-pivot regime so the LLM never derives it."""
+    if spot > gamma_flip:
+        return (
+            f"spot {spot:,.2f} is ABOVE pivot {gamma_flip:,.2f} — LONG gamma regime",
+            "BULLISH_ABSORPTION, BULLISH_DRIFT, CALL_WALL_RESISTANCE",
+            "above",
+        )
+    return (
+        f"spot {spot:,.2f} is BELOW pivot {gamma_flip:,.2f} — SHORT gamma regime",
+        "BEARISH_ABSORPTION, BEARISH_PRESSURE, PUT_WALL_SUPPORT",
+        "below",
+    )
 
 
 class LLMAnalyst:
@@ -156,6 +172,7 @@ class LLMAnalyst:
         if not _HAS_OPENAI:
             return None
 
+        relation, family, direction = _regime_context(spot, gamma_flip)
         prompt = ANALYST_PROMPT.format(
             ticker=ticker,
             spot=f"{spot:,.2f}",
@@ -163,6 +180,9 @@ class LLMAnalyst:
             put_wall=f"{put_wall:,.2f}",
             gamma_flip=f"{gamma_flip:,.2f}",
             net_gex=f"{net_gex:,.0f}",
+            relation=relation,
+            family=family,
+            direction=direction,
         )
 
         for provider in self._provider_chain():
