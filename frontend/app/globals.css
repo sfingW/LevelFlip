@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #0b0e14;
+  color: #e2e8f0;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-edge bg-card p-4;
+  }
+  .level-label {
+    @apply text-[10px] font-semibold uppercase tracking-widest text-muted;
+  }
+  .level-price {
+    @apply font-mono text-2xl font-bold tabular-nums;
+  }
+}
+
+/* slim dark scrollbars for dense surfaces */
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}

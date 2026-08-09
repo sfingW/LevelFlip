@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+numpy>=1.26.0
+scipy>=1.13.0
+pandas>=2.2.0
+cachetools>=5.5.0
+yfinance>=0.2.54
+openai>=1.55.0
+requests>=2.32.0
+python-dotenv>=1.0.1

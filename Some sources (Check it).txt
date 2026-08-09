@@ -1,0 +1,54 @@
+Some open source githubs can help or we can copy to use in the development of this website but just rememeber change  the UI/UX for the githubs repo to our website design UI/UX 
+
+
+How to execute this cleanly:
+
+1.Strip away their frontends completely Ignore the frontends (whether Streamlit, basic HTML, or CLI tools) in those repositories. You only need to import or copy their core mathematical calculation modules (e.g., gex_calculator.py or black_scholes.py).
+
+2.Wrap the Logic in Your API Microservice Place the extracted Python scripts into a clean FastAPI backend. When your client makes a request, your FastAPI microservice runs their math on the incoming options chain, converts the result into clean JSON, and passes it to your custom frontend
+
+3.Build Your Custom Frontend Visualizers
+With the clean JSON payload coming from your backend API, your Next.js/React app can render the data with your custom design language:
+
+Custom Level Cards: Highlight Call Wall, Put Wall, and Zero Gamma in custom metric cards styled with your color palette.
+
+TradingView Canvas Overlay: Render live price candlesticks with styled overlay lines corresponding to data.call_wall, data.put_wall, and data.gamma_flip.
+
+GEX Bar Profile: Plot the gex_profile array into a custom horizontal bar chart (using Recharts or Chart.js) with green bars for positive GEX and red bars for negative GEX.
+
+4.
+
+
+https://github.com/D3V-S4NJ4Y/FinanceGPT-Live.git
+
+https://github.com/MJCappella/FinanceGPT.git ( First of all check if its possible to use another LLM APi key provider to Replace replace keys with Groq or gemini but i have to decide first)
+
+https://github.com/ngoiyaeric/GPT-Investor.git(First of all check if its possible to use another LLM APi key provider to Replace replace keys with Groq or gemini but i have to decide first)
+
+https://github.com/erma0x/gexxer.git
+
+https://github.com/erma0x/financial_data_manager.git
+
+https://github.com/Kza56/OFK_Atas_GEX.git
+
+https://github.com/zrack/gex-terminal.git
+
+https://github.com/Proshotv2/Gamma-Vanna-Options-Exposure.git
+
+https://github.com/haus-edge/gex-levels.git
+
+https://github.com/MatBourgon/Gex3DViewer.git
+
+https://github.com/mcdallas/wallstreet.git
+
+https://github.com/pubnub/real-time-stocks.git
+
+https://github.com/gregtuc/StockSocket.git
+
+https://github.com/baileydanseglio/thetadata-python.git
+
+https://github.com/andriy-git/stocksTUI.git
+
+https://github.com/TickDB/tickdb-unified-realtime-marketdata-api.git
+
+
